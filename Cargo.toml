@@ -1,6 +1,6 @@
 [package]
 name = "audiobook-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Audiobook domain model — format-independent titles, parts and chapters assembled from MP3 (id3-core) and MP4 (mp4-core) containers"
@@ -14,7 +14,7 @@ exclude = [".github/"]
 # Estate L0 leaves. All three are no_std + alloc with a single thiserror
 # dependency, so this crate stays no_std too.
 id3-core = { version = "0.1", path = "../id3-core" }
-mp4-core = { version = "0.1", path = "../mp4-core" }
+mp4-core = { version = "0.2", path = "../mp4-core" }
 
 [dev-dependencies]
 proptest = "1"

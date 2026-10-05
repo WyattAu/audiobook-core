@@ -12,7 +12,7 @@
 //! read in the wrong order, a file that lies about its own chapters — which is
 //! the only reason this crate exists.
 
-use audiobook_core::chapter::concatenate_with_durations;
+use audiobook_core::chapter::{concatenate, concatenate_spanning};
 use audiobook_core::container::{detect, ContainerKind};
 use audiobook_core::mpeg::{parse_header, vbr_tag_offset, Layer, MpegVersion};
 use audiobook_core::probe::{mdat_size, MediaProbe};
@@ -460,15 +460,117 @@ fn per_file_durations_are_what_make_the_offsets_correct() {
         vec![(0u64, "B1".to_string())],
     ];
 
-    let guessed = concatenate_with_durations(&files, &[0, 0]);
+    // Concatenation preserves each file's own container times and attributes each
+    // chapter to its file; the whole-title offsets come from laying the parts out,
+    // which is where the durations are actually used. Without durations every part
+    // starts at zero, so the offsets are lost — and the difference is visible.
+    let no_durations = Title::from_flat_chapters(concatenate(&files), &[0, 0], "Book", "Author");
     assert_eq!(
-        guessed[2].start_ms, 0,
+        no_durations.chapters()[2].start_ms,
+        0,
         "with no durations the offset is lost"
     );
 
-    let exact = concatenate_with_durations(&files, &[600_000, 300_000]);
-    assert_eq!(exact[2].start_ms, 600_000, "a real duration restores it");
-    assert_eq!(exact[2].title, "B1");
+    let exact =
+        Title::from_flat_chapters(concatenate(&files), &[600_000, 300_000], "Book", "Author");
+    assert_eq!(
+        exact.chapters()[2].start_ms,
+        600_000,
+        "a real duration restores it"
+    );
+    assert_eq!(exact.chapters()[2].title, "B1");
+    assert_eq!(exact.duration_ms(), Some(900_000));
+}
+
+#[test]
+fn a_chapter_that_spans_files_still_seeks_correctly() {
+    // The shape real M4B tooling produces: parts → chapters → files, where a chapter
+    // names several source files. Audible and Librivox split on time, so a boundary
+    // lands mid-file and one chapter routinely runs across two.
+    //
+    // Before this was representable, the boundary was either dropped or attributed
+    // to the wrong file — and a seek landed in the wrong place with no error anywhere.
+    let files = vec![
+        // 20 min long; "Chapter Two" starts 10 min in and runs past the end.
+        vec![
+            (0u64, "Chapter One".into()),
+            (600_000, "Chapter Two".into()),
+        ],
+        // 15 min long. Its first chapter starts 30 s in, so those first 30 s are the
+        // tail of "Chapter Two" — the real-world case of a boundary landing mid-file.
+        vec![
+            (30_000, "Chapter Three".into()),
+            (300_000, "Chapter Four".into()),
+        ],
+        vec![(0u64, "Chapter Five".into())],
+    ];
+    let durations = [1_200_000u64, 900_000, 600_000];
+    // Files 0 and 1 both end mid-chapter.
+    let continues = [true, true, false];
+
+    let chapters = concatenate_spanning(&files, &continues);
+    assert_eq!(
+        chapters[0].parts,
+        vec![0usize],
+        "Chapter One is inside file 0"
+    );
+    assert_eq!(
+        chapters[1].parts,
+        vec![0usize, 1],
+        "Chapter Two starts in file 0 and continues into file 1"
+    );
+    assert!(chapters[1].spans_parts());
+
+    let title = Title::from_flat_chapters(chapters, &durations, "Book", "Author");
+    assert_eq!(title.duration_ms(), Some(2_700_000));
+
+    // The whole-title offsets, which are what a seek bar uses. A chapter's offset
+    // comes from the file it *starts* in, so Chapter Two is 600 s in, not 1200 s.
+    let flat = title.chapters();
+    let offsets: Vec<(&str, u64)> = flat
+        .iter()
+        .map(|c| (c.title.as_str(), c.start_ms))
+        .collect();
+    assert_eq!(
+        offsets,
+        vec![
+            ("Chapter One", 0),
+            ("Chapter Two", 600_000),
+            // File 1 starts 1 200 s in; its first chapter is 30 s further on.
+            ("Chapter Three", 1_230_000),
+            ("Chapter Four", 1_500_000),
+            ("Chapter Five", 2_100_000),
+        ]
+    );
+
+    // A seek anywhere resolves to the right chapter, including just inside a
+    // straddling one.
+    for (at, want) in [
+        (0u64, "Chapter One"),
+        (599_999, "Chapter One"),
+        (600_000, "Chapter Two"),
+        (1_199_999, "Chapter Two"),
+        (1_229_999, "Chapter Two"),
+        (1_230_000, "Chapter Three"),
+        (1_499_999, "Chapter Three"),
+        (1_500_000, "Chapter Four"),
+        (2_099_999, "Chapter Four"),
+        (2_100_000, "Chapter Five"),
+    ] {
+        assert_eq!(
+            title.chapter_at(at).map(|c| c.title.as_str()),
+            Some(want),
+            "at {at} ms"
+        );
+    }
+
+    // Which file is playing also has to be right across a straddling chapter.
+    assert_eq!(title.part_at(0).map(|p| p.offset_ms), Some(0));
+    assert_eq!(title.part_at(1_199_999).map(|p| p.offset_ms), Some(0));
+    assert_eq!(
+        title.part_at(1_200_000).map(|p| p.offset_ms),
+        Some(1_200_000)
+    );
 }
 
 #[test]
@@ -478,13 +580,13 @@ fn a_part_with_unknown_length_does_not_swallow_the_next_one() {
     let title = Title::new("Book", "Author")
         .with_part(Part {
             title: String::from("No length"),
-            chapters: vec![Chapter::new("One", 0)],
+            chapters: vec![Chapter::new("One", 0, 0)],
             offset_ms: 0,
             duration_ms: None,
         })
         .with_part(Part {
             title: String::from("Known"),
-            chapters: vec![Chapter::new("Two", 0)],
+            chapters: vec![Chapter::new("Two", 0, 0)],
             offset_ms: 0,
             duration_ms: Some(1_000),
         });
@@ -534,7 +636,10 @@ fn validation_catches_a_producer_that_wrote_chapters_out_of_order() {
     // one, and `validate` is what catches it before it reaches a player.
     let broken = Title::new("Bad", "Author").with_part(Part {
         title: String::new(),
-        chapters: vec![Chapter::new("Second", 1_800_000), Chapter::new("First", 0)],
+        chapters: vec![
+            Chapter::new("Second", 1_800_000, 0),
+            Chapter::new("First", 0, 0),
+        ],
         offset_ms: 0,
         duration_ms: Some(3_600_000),
     });

@@ -3,6 +3,63 @@
 All notable changes to this project are documented here. Format: [Keep a
 Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
 
+## [0.2.0] - 2026-10-05
+
+Chapters can now span files, which is the shape real audiobook tooling produces.
+
+### Added
+
+- **`Chapter::parts`** — the parts a chapter occupies. A chapter is not a file: a
+  book's chapter boundary frequently lands mid-file, because Audible and Librivox
+  split on time rather than on file, so a 14-minute chapter can begin 3 minutes into
+  an 18-minute MP3, and one chapter routinely runs across two files. Tools that build
+  M4Bs express this as a three-level **parts → chapters → files** structure where a
+  chapter names several source files.
+  A model where a chapter lives inside exactly one file cannot represent that, and
+  the failure is worse than a missing feature: the boundary is either dropped or
+  attributed to the wrong file, and a seek lands in the wrong place with no error
+  anywhere.
+- **`chapter::concatenate_spanning`** — concatenates per-file chapters with the caller
+  declaring, one bit per file, which files' last chapters run on. Where a span *ends*
+  is derived rather than guessed: the first following file whose first chapter starts
+  at zero, because that is where the chapter ends and none of that file's audio is its
+  own. A next file whose first chapter starts *after* zero contributes its opening
+  audio, so it is included.
+- **`Title::from_flat_chapters`** — assembles a title from a flat chapter list plus
+  one length per part, filing **each chapter under the part it starts in**. Building
+  the parts by hand and filing a chapter under the part it merely *spans* is the easy
+  mistake, and the consequence is a chapter whose whole-title offset comes from the
+  wrong file.
+
+### Changed
+
+- **Chapter times are now part-local, not title-absolute.** `concatenate` preserves
+  what each container stated and records which part each chapter came from;
+  `Title::laid_out` computes the whole-title offsets, because they depend on the
+  parts' lengths and nothing in a per-file container knows those. This is a **breaking
+  change** to `Chapter::start_ms` semantics and the reason for the minor version bump
+  while the crate is 0.x.
+- **`concatenate_with_durations` is gone.** With the offsets moved to `laid_out` it
+  took a parameter it did not use, and a signature that lies about where numbers come
+  from is worse than one that is missing. The per-file lengths are now supplied once,
+  to `Title::from_flat_chapters`.
+- **`Title::with_part_at` renumbers chapters.** A chapter names its part by index,
+  and a stale index points at a real but wrong file — so moving a part maps every
+  chapter's `parts` through the same permutation before re-laying out.
+
+### Fixed
+
+Found while building the above, each caught by an invariant that did not exist before:
+
+1. `Chapter::spanning` filtered out part 0 from the span it was given, so a chapter
+   could never include the file it started in.
+2. `concatenate_spanning` passed the *tail* of the span rather than the whole span,
+   compounding the above.
+3. `from_flat_chapters` filed an out-of-range chapter into the last part without
+   renaming it, leaving its stored index disagreeing with the part holding it.
+   Nothing is dropped — losing a boundary silently is the worst failure — and the span
+   of a chapter naming parts that do not exist collapses to the one it was filed under.
+
 ## [0.1.0] - 2026-10-05
 
 First release. `audiobook-core` is the estate's L1 audiobook layer: the place
@@ -85,7 +142,12 @@ field. Both are recorded in `mp4-core`'s changelog.
   format tables do, but only Layer III is exercised end to end.
 - **`CTOC` nesting is not turned into parts.** `id3-core` resolves a `CTOC` into
   ordered chapters; this crate flattens them into one part rather than building a
-  nested part hierarchy, which is a real loss for a multi-disc edition.
+  nested part hierarchy, which is a real loss for a multi-disc edition. The next
+  piece of work.
+- **No sidecar chapter formats.** A `.txt` or FFMetadata chapter file alongside the
+  audio, an EPUB table of contents, or an Audnex API response are all chapter sources
+  `audiobook-forge` supports and this crate does not. A `.txt` file needs no
+  dependency and is the obvious next addition.
 - **No cover-art validation.** Bytes are passed through raw; `media-kit` owns
   checking that they decode.
 - **The frame walk is capped at 16 M frames.** Long enough for a 200 MB file at the

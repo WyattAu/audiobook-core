@@ -106,23 +106,25 @@ impl Title {
     /// Every chapter across every part, in playing order, with times relative to
     /// the **whole title**.
     ///
-    /// A part's own [`Part::chapters`] are file-local, which is what a player
-    /// seeking inside one file needs; this view adds each part's offset so a
-    /// whole-book seek bar can use it directly. Mixing the two is the mistake a
-    /// flat list invites, so the absolute one is what the public API returns and
-    /// the local one is reached deliberately through the part.
+    /// A part's own [`Part::chapters`] are part-local, which is what a player
+    /// seeking inside one file needs; this view rebases each onto the title. Mixing
+    /// the two is the mistake a flat list invites, so the absolute one is what the
+    /// public API returns and the local one is reached deliberately through the part.
+    ///
+    /// The result is a projection: a chapter spanning a part boundary appears
+    /// **once**, with [`Chapter::parts`] naming every part it covers, because a flat
+    /// list that repeated it would make the boundary ambiguous rather than clearer.
     #[must_use]
     pub fn chapters(&self) -> Vec<Chapter> {
-        let mut out: Vec<Chapter> = Vec::new();
-        for part in &self.parts {
-            for c in &part.chapters {
-                out.push(Chapter::new(
-                    &c.title,
-                    part.offset_ms.saturating_add(c.start_ms),
-                ));
-            }
-        }
-        out
+        self.parts
+            .iter()
+            .flat_map(|part| part.chapters.iter())
+            .map(|c| {
+                let mut rebased = c.clone();
+                rebased.start_ms = c.title_start_ms();
+                rebased
+            })
+            .collect()
     }
 
     /// The chapter playing at `at_ms`, if any.
@@ -168,6 +170,24 @@ impl Title {
             part.offset_ms = cursor;
             cursor = cursor.saturating_add(part.effective_duration_ms());
         }
+        // Chapter offsets are *derived* from the part offsets, so they can only be
+        // filled in once those are final — which is why this is a second pass rather
+        // than something the part's constructor could do.
+        //
+        // A chapter's offset comes from the part it *starts* in, not the part holding
+        // it: a chapter spanning parts 2 and 3 begins in part 2, and its start is part
+        // 2's offset plus its part-local time.
+        for (i, part) in self.parts.iter_mut().enumerate() {
+            let offset = part.offset_ms;
+            for c in &mut part.chapters {
+                debug_assert!(
+                    c.first_part() == i,
+                    "a chapter stored in part {i} claims to start in part {}",
+                    c.first_part()
+                );
+                c.set_title_offset(offset);
+            }
+        }
         self
     }
 
@@ -175,6 +195,98 @@ impl Title {
     #[must_use]
     pub fn parts_with_offsets(&self) -> &[Part] {
         &self.parts
+    }
+
+    /// Assemble a title from a flat chapter list plus one length per part.
+    ///
+    /// This is the constructor to reach for when the chapters come from
+    /// [`crate::chapter::concatenate_spanning`], because it places **each chapter in
+    /// the part it starts in** — which is the invariant every other operation on this
+    /// type assumes. Building the parts by hand and then filing a chapter under the
+    /// part it merely *spans* is the easy mistake, and the consequence is a chapter
+    /// whose whole-title offset comes from the wrong part.
+    ///
+    /// A chapter naming a part index that does not exist is kept, in the last part,
+    /// rather than dropped: losing a boundary silently is the failure this crate
+    /// treats as worst.
+    #[must_use]
+    pub fn from_flat_chapters(
+        chapters: Vec<Chapter>,
+        durations: &[u64],
+        title: &str,
+        author: &str,
+    ) -> Self {
+        let mut parts: Vec<Part> = durations
+            .iter()
+            .map(|d| Part {
+                title: String::new(),
+                chapters: Vec::new(),
+                offset_ms: 0,
+                duration_ms: Some(*d),
+            })
+            .collect();
+        // No durations given: one part per distinct index the chapters name.
+        if parts.is_empty() {
+            let needed = chapters
+                .iter()
+                .map(|c| c.first_part() + 1)
+                .max()
+                .unwrap_or(1);
+            parts = (0..needed)
+                .map(|_| Part {
+                    title: String::new(),
+                    chapters: Vec::new(),
+                    offset_ms: 0,
+                    duration_ms: None,
+                })
+                .collect();
+        }
+
+        let highest = parts.len().saturating_sub(1);
+        for mut c in chapters {
+            let declared = c.first_part();
+            // A chapter naming parts this title does not have has a meaningless
+            // span, so it is filed under the last part it *could* mean and its span
+            // collapses to that one. Keeping the old span would leave the stored
+            // index disagreeing with the part holding it.
+            let index = declared.min(highest);
+            if declared > highest {
+                c.file_under(index);
+            }
+            match parts.get_mut(index) {
+                Some(part) => part.chapters.push(c),
+                // Only reachable when `durations` was empty *and* no chapter named
+                // a part, which the `needed` fallback above already covers. Kept so
+                // the loop cannot panic on a pathological input.
+                None => continue,
+            }
+        }
+
+        let chapter_source = if parts.iter().all(|p| p.chapters.is_empty()) {
+            ChapterSource::None
+        } else {
+            ChapterSource::Declared
+        };
+        let duration: u64 = durations
+            .iter()
+            .copied()
+            .fold(0u64, |a, b| a.saturating_add(b));
+
+        Self {
+            title: String::from(title),
+            author: String::from(author),
+            duration_ms: if duration > 0 { Some(duration) } else { None },
+            confidence: if duration > 0 {
+                Confidence::Declared
+            } else {
+                Confidence::Unknown
+            },
+            chapter_source,
+            parts,
+            part_source: PartSource::PerFile,
+            ..Self::default()
+        }
+        .laid_out()
     }
 
     /// The total chapter count.
@@ -258,7 +370,7 @@ impl Title {
                 chapters: probe
                     .chapters
                     .iter()
-                    .map(|(ms, t)| Chapter::new(t, *ms))
+                    .map(|(ms, t)| Chapter::new(t, *ms, 0))
                     .collect(),
                 // A single file's length is the probe's own duration when it had
                 // one; without it the part falls back to the implied span.
@@ -302,7 +414,7 @@ impl Title {
     ) -> Self {
         let per_file: Vec<Vec<(u64, String)>> = probes.iter().map(|p| p.chapters.clone()).collect();
 
-        let chapters = crate::chapter::concatenate_with_durations(&per_file, durations);
+        let chapters = crate::chapter::concatenate(&per_file);
         let chapter_source = if chapters.is_empty() {
             ChapterSource::None
         } else {
@@ -369,7 +481,7 @@ impl Title {
                     chapters: p
                         .chapters
                         .iter()
-                        .map(|(ms, t)| Chapter::new(t, *ms))
+                        .map(|(ms, t)| Chapter::new(t, *ms, i))
                         .collect(),
                     // The file's own length, when the caller supplied one. This
                     // is what lets `part_at` say which file is playing: a part
@@ -527,6 +639,36 @@ impl Title {
         }
         let part = self.parts.remove(from);
         self.parts.insert(to, part);
+
+        // Renumber every chapter's part references, because a chapter names a part
+        // by index and a stale index points at a real but wrong file. This is the
+        // price of storing indices rather than back-pointers, and paying it here is
+        // cheaper than having every consumer of `Chapter::parts` check.
+        let count = self.parts.len();
+        let mut mapping = vec![count; count];
+        let mut old = 0usize;
+        while old < count {
+            if old == from {
+                old += 1;
+                continue;
+            }
+            let new = if old < from { old } else { old - 1 };
+            let moved = if new >= to { new + 1 } else { new };
+            if let Some(slot) = mapping.get_mut(old) {
+                *slot = moved;
+            }
+            old += 1;
+        }
+        if let Some(slot) = mapping.get_mut(from) {
+            *slot = to;
+        }
+
+        for part in &mut self.parts {
+            for c in &mut part.chapters {
+                c.remap_parts(&mapping);
+            }
+        }
+
         self.laid_out()
     }
 
@@ -588,9 +730,9 @@ mod tests {
         let title = Title::new("Book", "Author").with_part(Part {
             title: String::new(),
             chapters: vec![
-                Chapter::new("One", 0),
-                Chapter::new("Two", 60_000),
-                Chapter::new("Three", 120_000),
+                Chapter::new("One", 0, 0),
+                Chapter::new("Two", 60_000, 0),
+                Chapter::new("Three", 120_000, 0),
             ],
             offset_ms: 0,
             duration_ms: Some(180_000),
@@ -683,13 +825,13 @@ mod tests {
         let title = Title::new("Book", "Author")
             .with_part(Part {
                 title: String::from("Disc One"),
-                chapters: vec![Chapter::new("One", 0), Chapter::new("Two", 60_000)],
+                chapters: vec![Chapter::new("One", 0, 0), Chapter::new("Two", 60_000, 0)],
                 offset_ms: 0,
                 duration_ms: Some(60_000),
             })
             .with_part(Part {
                 title: String::from("Disc Two"),
-                chapters: vec![Chapter::new("Three", 0)],
+                chapters: vec![Chapter::new("Three", 0, 0)],
                 offset_ms: 0,
                 duration_ms: Some(30_000),
             });
@@ -700,7 +842,7 @@ mod tests {
     fn validation_catches_out_of_order_chapters() {
         let title = Title::new("Book", "Author").with_part(Part {
             title: String::new(),
-            chapters: vec![Chapter::new("Two", 60_000), Chapter::new("One", 0)],
+            chapters: vec![Chapter::new("Two", 60_000, 0), Chapter::new("One", 0, 0)],
             offset_ms: 0,
             duration_ms: None,
         });
@@ -716,7 +858,7 @@ mod tests {
         // cannot be built.
         let title = Title::new("Book", "Author").with_part(Part {
             title: String::new(),
-            chapters: vec![Chapter::new("One", 0), Chapter::new("Two", 0)],
+            chapters: vec![Chapter::new("One", 0, 0), Chapter::new("Two", 0, 0)],
             offset_ms: 0,
             duration_ms: None,
         });
@@ -731,7 +873,7 @@ mod tests {
         // Both empty: indistinguishable, so nothing is ambiguous.
         let title = Title::new("Book", "Author").with_part(Part {
             title: String::new(),
-            chapters: vec![Chapter::untitled(0), Chapter::untitled(0)],
+            chapters: vec![Chapter::untitled(0, 0), Chapter::untitled(0, 0)],
             offset_ms: 0,
             duration_ms: None,
         });
@@ -747,7 +889,7 @@ mod tests {
         }
         .with_part(Part {
             title: String::new(),
-            chapters: vec![Chapter::new("Way Out", 999_000)],
+            chapters: vec![Chapter::new("Way Out", 999_000, 0)],
             offset_ms: 0,
             duration_ms: None,
         });
@@ -775,13 +917,13 @@ mod tests {
         let title = Title::new("Book", "Author")
             .with_part(Part {
                 title: String::from("Disc One"),
-                chapters: vec![Chapter::new("One", 0)],
+                chapters: vec![Chapter::new("One", 0, 0)],
                 offset_ms: 0,
                 duration_ms: Some(60_000),
             })
             .with_part(Part {
                 title: String::from("Disc Two"),
-                chapters: vec![Chapter::new("Two", 0)],
+                chapters: vec![Chapter::new("Two", 0, 1)],
                 offset_ms: 0,
                 duration_ms: Some(30_000),
             })
@@ -799,19 +941,19 @@ mod tests {
         let title = Title::new("Book", "Author")
             .with_part(Part {
                 title: String::from("A"),
-                chapters: vec![Chapter::new("a", 0)],
+                chapters: vec![Chapter::new("a", 0, 0)],
                 offset_ms: 0,
                 duration_ms: Some(10_000),
             })
             .with_part(Part {
                 title: String::from("B"),
-                chapters: vec![Chapter::new("b", 0)],
+                chapters: vec![Chapter::new("b", 0, 1)],
                 offset_ms: 0,
                 duration_ms: Some(20_000),
             })
             .with_part(Part {
                 title: String::from("C"),
-                chapters: vec![Chapter::new("c", 0)],
+                chapters: vec![Chapter::new("c", 0, 2)],
                 offset_ms: 0,
                 duration_ms: Some(30_000),
             })
@@ -824,6 +966,77 @@ mod tests {
         assert_eq!(moved.parts[0].offset_ms, 0);
         assert_eq!(moved.parts[1].offset_ms, 30_000, "C is 30 s long");
         assert_eq!(moved.parts[2].offset_ms, 40_000, "then A's 10 s");
+
+        // The move renumbers the chapters, because a chapter names its part by
+        // index and a stale index points at a real but wrong file.
+        assert_eq!(moved.parts[0].chapters[0].first_part(), 0);
+        assert_eq!(moved.parts[0].chapters[0].title, "c");
+        assert_eq!(moved.parts[1].chapters[0].first_part(), 1);
+        assert_eq!(moved.parts[2].chapters[0].first_part(), 2);
+    }
+
+    #[test]
+    fn a_flat_chapter_list_is_filed_under_the_part_it_starts_in() {
+        // The three-level shape real tooling uses: a chapter that begins in part 0 and
+        // runs through part 2. Filing it under the part it merely *spans* would give
+        // it part 2's offset, which is wrong by the length of two files.
+        use alloc::format;
+        let chapters = alloc::vec![
+            Chapter::spanning("Long", 0, &[0, 1, 2]),
+            Chapter::new("Tail", 0, 2),
+        ];
+        let title =
+            Title::from_flat_chapters(chapters, &[600_000, 600_000, 300_000], "Book", "Author");
+
+        assert_eq!(title.parts.len(), 3);
+        assert_eq!(title.parts[0].chapters.len(), 1, "it lives in part 0");
+        assert_eq!(title.parts[0].chapters[0].title, "Long");
+        assert_eq!(title.parts[2].chapters.len(), 1, "the tail is part 2's");
+
+        // Its whole-title start comes from part 0, not from where the list is stored.
+        let flat = title.chapters();
+        assert_eq!(flat[0].start_ms, 0);
+        assert_eq!(flat[0].parts, alloc::vec![0, 1, 2]);
+        assert_eq!(flat[1].start_ms, 1_200_000, "1200 s is the end of part 1");
+        assert_eq!(title.duration_ms(), Some(1_500_000));
+        let _ = format!("{:?}", flat.len());
+    }
+
+    #[test]
+    fn a_chapter_naming_a_part_that_does_not_exist_is_kept_not_dropped() {
+        // Losing a boundary silently is the worst failure, so an out-of-range
+        // chapter lands in the last part where it is at least reachable.
+        let chapters = alloc::vec![Chapter::new("Real", 0, 0), Chapter::new("Ghost", 5, 9)];
+        let title = Title::from_flat_chapters(chapters, &[1_000], "Book", "Author");
+        assert_eq!(title.chapter_count(), 2, "nothing is dropped");
+        assert_eq!(title.parts[0].chapters[0].title, "Real");
+        assert_eq!(title.parts[0].chapters[1].title, "Ghost");
+    }
+
+    #[test]
+    fn a_flat_chapter_list_with_no_durations_still_assembles() {
+        let chapters = alloc::vec![
+            Chapter::new("A", 0, 0),
+            Chapter::new("B", 0, 1),
+            Chapter::new("C", 0, 2),
+        ];
+        let title = Title::from_flat_chapters(chapters, &[], "Book", "Author");
+        assert_eq!(
+            title.parts.len(),
+            3,
+            "one part per part index the chapters name"
+        );
+        assert_eq!(title.chapter_count(), 3);
+        assert_eq!(title.duration_ms(), None, "no lengths were supplied");
+        assert!(!title.has_exact_duration());
+    }
+
+    #[test]
+    fn an_empty_flat_chapter_list_declares_no_chapters() {
+        let title = Title::from_flat_chapters(alloc::vec![], &[1_000], "Book", "Author");
+        assert_eq!(title.chapter_source, ChapterSource::None);
+        assert_eq!(title.chapter_count(), 0);
+        assert_eq!(title.duration_ms(), Some(1_000));
     }
 
     #[test]
@@ -844,7 +1057,7 @@ mod tests {
     fn a_duration_falls_back_to_the_last_chapter_but_stays_imprecise() {
         let title = Title::new("Book", "Author").with_part(Part {
             title: String::new(),
-            chapters: vec![Chapter::new("One", 0), Chapter::new("Two", 90_000)],
+            chapters: vec![Chapter::new("One", 0, 0), Chapter::new("Two", 90_000, 0)],
             offset_ms: 0,
             duration_ms: None,
         });
@@ -865,7 +1078,7 @@ mod tests {
         }
         .with_part(Part {
             title: String::new(),
-            chapters: vec![Chapter::new("One", 90_000)],
+            chapters: vec![Chapter::new("One", 90_000, 0)],
             offset_ms: 0,
             duration_ms: None,
         });
@@ -903,13 +1116,13 @@ mod tests {
         let title = Title::new("Book", "Author")
             .with_part(Part {
                 title: String::from("Disc One"),
-                chapters: vec![Chapter::new("One", 0), Chapter::new("Two", 60_000)],
+                chapters: vec![Chapter::new("One", 0, 0), Chapter::new("Two", 60_000, 0)],
                 offset_ms: 0,
                 duration_ms: Some(60_000),
             })
             .with_part(Part {
                 title: String::from("Disc Two"),
-                chapters: vec![Chapter::new("Three", 0)],
+                chapters: vec![Chapter::new("Three", 0, 0)],
                 offset_ms: 0,
                 duration_ms: Some(30_000),
             });

@@ -78,7 +78,7 @@
 //! // A hand-built title, when the caller already knows the shape.
 //! let manual = Title::new("Book", "Author").with_part(Part {
 //!     title: String::new(),
-//!     chapters: vec![Chapter::new("Only", 0)],
+//!     chapters: vec![Chapter::new("Only", 0, 0)],
 //!     offset_ms: 0,
 //!     duration_ms: Some(1_000),
 //! });

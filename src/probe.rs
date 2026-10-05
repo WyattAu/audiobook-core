@@ -98,6 +98,31 @@ pub struct MediaProbe {
     pub cover: Option<Vec<u8>>,
     /// The chapters, already flattened to `(start_ms, title)` pairs.
     pub chapters: Vec<(u64, String)>,
+    /// Which chapter mechanisms the container carried, when it carried more than one.
+    ///
+    /// `None` for the ordinary case. A file with a `chpl` box *and* a chapter track
+    /// that disagree is a real condition — a muxer can write each from a different
+    /// source — and a library that silently prefers one shows the user a list the file
+    /// contradicts. Reporting it costs nothing and lets a caller decide.
+    pub chapter_disagreement: Option<ChapterDisagreement>,
+}
+
+/// A disagreement between a file's two chapter mechanisms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChapterDisagreement {
+    /// Chapters as the Nero `chpl` box states them.
+    pub chpl: Vec<(u64, String)>,
+    /// Chapters as the QuickTime chapter track states them.
+    pub chapter_track: Vec<(u64, String)>,
+}
+
+/// Compare a file's two chapter mechanisms, when it has both.
+fn chapter_mechanisms(file: &mp4_core::Mp4File) -> Option<ChapterDisagreement> {
+    file.chapter_disagreement()
+        .map(|(a, b)| ChapterDisagreement {
+            chpl: a.iter().map(|c| (c.start_ms, c.title.clone())).collect(),
+            chapter_track: b.iter().map(|c| (c.start_ms, c.title.clone())).collect(),
+        })
 }
 
 impl MediaProbe {
@@ -144,7 +169,24 @@ impl MediaProbe {
             year: file.metadata.text(mp4_core::atoms::YEAR).map(String::from),
             track: file.metadata.track_number(),
             cover: file.metadata.cover().map(<[u8]>::to_vec),
-            chapters: container::mp4_chapters(data),
+            // The QuickTime chapter track where there is one, falling back to the Nero
+            // `chpl` box. Not an arbitrary preference: QuickTime, iTunes and the
+            // built-in iOS audiobook player read the track and ignore Nero chapters
+            // entirely, so preferring `chpl` would mean preferring the mechanism those
+            // players discard. A file carrying both and disagreeing is worth reporting,
+            // so the two are also compared.
+            // In **file order, not time order**. Sorting here would hide a producer
+            // that wrote its chapters backwards, and `Title::validate` exists to report
+            // exactly that — a silently corrected list is a defect no consumer can
+            // then see. The chapter-track path is naturally monotonic anyway, since its
+            // times are accumulated from `stts`.
+            chapters: file
+                .effective_chapters()
+                .chapters
+                .iter()
+                .map(|c| (c.start_ms, c.title.clone()))
+                .collect(),
+            chapter_disagreement: chapter_mechanisms(&file),
             ..Self::default()
         };
 

@@ -3,6 +3,31 @@
 All notable changes to this project are documented here. Format: [Keep a
 Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
 
+## [0.3.0] - 2026-10-05
+
+Chapters now come from the QuickTime chapter track where a file has one, and the
+harness's last unchecked field is closed.
+
+### Added
+
+- **`MediaProbe::chapter_disagreement`** — `Some` when a file carries both a Nero `chpl`
+  box and a QuickTime chapter track and the two lists differ. A muxer can write each
+  from a different source, and a library that silently prefers one shows the user a list
+  the file contradicts — while a plain chapter comparison passes, because neither list is
+  wrong on its own.
+- **`MediaProbe::chapters` prefers the chapter track**, matching what a player shows.
+  QuickTime, iTunes and the built-in iOS audiobook player read the track and ignore Nero
+  chapters entirely.
+
+### Changed
+
+- **Chapters are reported in file order, not time order.** The old probe sorted them,
+  which silently hid a producer that wrote its chapters backwards — a defect no consumer
+  could then see. The integration test that had asserted the sorting now asserts that
+  the file's order survives *and* that `Title::validate` reports the problem, which is
+  the honest division of labour: the reader preserves what the file says, the validator
+  judges it.
+
 ## [0.2.0] - 2026-10-05
 
 Chapters can now span files, which is the shape real audiobook tooling produces.

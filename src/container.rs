@@ -179,9 +179,11 @@ pub fn mp4_chapters(data: &[u8]) -> Vec<(u64, String)> {
     let Ok(file) = mp4_core::Mp4File::parse(data) else {
         return Vec::new();
     };
-    file.chapters
-        .sorted()
-        .into_iter()
+    // The QuickTime chapter track where present, falling back to the Nero `chpl` box —
+    // the same preference `MediaProbe::probe_mp4` documents.
+    file.effective_chapters()
+        .chapters
+        .iter()
         .map(|c| (c.start_ms, c.title.clone()))
         .collect()
 }

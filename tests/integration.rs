@@ -627,10 +627,15 @@ fn validation_catches_a_producer_that_wrote_chapters_out_of_order() {
     );
     let title = Title::from_probe(&MediaProbe::probe(&data), "bad.m4b", "y");
 
-    // The reader sorts, so what surfaces is already ordered...
-    let titles: Vec<_> = title.chapters().iter().map(|c| c.title.clone()).collect();
-    let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
-    assert_eq!(titles, vec!["First", "Second"]);
+    // The file's order is preserved rather than corrected. Sorting here would hide the
+    // defect, and `validate` is what reports it — a silently fixed list is one no
+    // consumer can then see.
+    let titles: Vec<String> = title.chapters().iter().map(|c| c.title.clone()).collect();
+    assert_eq!(titles, vec!["Second", "First"], "as the file wrote them");
+    assert!(
+        title.validate().is_err(),
+        "so the defect is still visible to a caller that checks"
+    );
 
     // ...but a caller who rebuilds a title by hand can still produce an invalid
     // one, and `validate` is what catches it before it reaches a player.

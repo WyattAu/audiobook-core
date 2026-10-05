@@ -14,7 +14,7 @@ exclude = [".github/"]
 # Estate L0 leaves. All three are no_std + alloc with a single thiserror
 # dependency, so this crate stays no_std too.
 id3-core = { version = "0.1", path = "../id3-core" }
-mp4-core = { version = "0.2", path = "../mp4-core" }
+mp4-core = { version = "0.2.1", path = "../mp4-core" }
 
 [dev-dependencies]
 proptest = "1"

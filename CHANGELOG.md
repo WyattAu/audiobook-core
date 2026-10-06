@@ -3,6 +3,29 @@
 All notable changes to this project are documented here. Format: [Keep a
 Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
 
+## [0.5.0] - 2026-10-06
+
+No API change; a behaviour change inherited from `id3-core`, and a big one for MP3.
+
+### Fixed
+
+- **ID3v2.3 tags now yield anything at all.** `MediaProbe` reads metadata through
+  `id3_core::Tag::parse`, and every v2.3 tag failed to parse there \u{2014} v2.4's ten-byte
+  frame header was used for v2.3's frames \u{2014} so the title, artist, album and chapters
+  all came back empty. Nothing in the corpus caught it because ffmpeg, which writes every
+  fixture, emits v2.4.
+
+  `MediaProbe::chapters` on an MP3 is now covered by the conformance harness against
+  ffprobe on three ID3v2.3 and `CHAP`-bearing shapes, none of which ffmpeg can produce.
+
+### Notes
+
+- `MediaProbe` reads MP3 chapters through `id3_core::Tag::resolved_chapters`, which orders
+  by time rather than by TOC order. A `CTOC` whose top-level flag is misread therefore
+  does not change the chapter list a player shows \u{2014} it changes nesting depth, which
+  this crate does not model. See `id3-core` 0.2.0 for the flag defect itself and the
+  harness's `UNCHECKED_FIELDS` for the gap that hides it here.
+
 ## [0.4.0] - 2026-10-06
 
 Chapters arrive outside the audio file more often than not, so the sidecar formats the

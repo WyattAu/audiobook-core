@@ -1,6 +1,6 @@
 [package]
 name = "audiobook-core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Audiobook domain model — format-independent titles, parts and chapters assembled from MP3 (id3-core) and MP4 (mp4-core) containers"

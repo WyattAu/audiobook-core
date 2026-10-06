@@ -31,6 +31,32 @@ however it was packaged, with its parts, chapters, and duration.
   ways a producer can make a title internally inconsistent.
 - **`container`** — signature-based detection, because an M4B is regularly named
   `.mp3` after a bad download.
+- **`sidecar`** — the four chapter sidecar formats real tooling exchanges, read *and*
+  written: ffmpeg's `;FFMETADATA1`, MP4Box's `CHAPTER01`/`CHAPTER01NAME`, bare
+  `h:mm:ss name` timecodes, and ZoomPlayer's `AddChapter*`. Writing FFMetadata is how
+  a library mutes chapters into an M4B without shipping a muxer.
+
+## The sidecar traps
+
+Chapters frequently are not in the audio file, and the formats are full of edges that
+cost real data. Each of these was found by running ffmpeg, not by reading about it,
+and each has a test:
+
+- **Whitespace around `=` loses the chapter title.** ffmpeg reads `START =0` as a tag
+  named `START ` and the chapter appears with an empty title, with only a warning on
+  stderr. Reported as `SidecarWarning::WhitespaceInKey`.
+- **No `TIMEBASE` means nanoseconds.** `END=60000000000` with no timebase reads back as
+  60 seconds. Some older documentation says milliseconds, which would make it a
+  60 000-second chapter. Reported as `SidecarWarning::NoTimebase`.
+- **ffmpeg dumps the audio timebase** (`1/44100`), not `1/1000`.
+- **A newline in a title is a backslash at end of line.** It reads back as a newline,
+  so a line-by-line reader truncates the title and then trips over the rest as a
+  syntax error.
+- **A title ending in a backslash costs the file a chapter.** ffmpeg takes the escaped
+  `\\` as a line continuation and swallows the next `[CHAPTER]` header; the chapter
+  count drops and the survivor reports a start time of zero, silently. This crate
+  counts backslashes and keeps every chapter, and reports the hazard — see
+  `ffmpeg_reads_back`.
 
 ## What it deliberately will not do
 

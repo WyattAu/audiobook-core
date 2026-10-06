@@ -3,6 +3,62 @@
 All notable changes to this project are documented here. Format: [Keep a
 Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
 
+## [0.4.0] - 2026-10-06
+
+Chapters arrive outside the audio file more often than not, so the sidecar formats the
+tools actually exchange are now read and written.
+
+### Added
+
+- **`sidecar` module** — reads and writes the four chapter sidecar formats real tooling
+  uses, with no dependency and no I/O:
+  - ffmpeg's `;FFMETADATA1`, which is what `ffmpeg -i x -i chapters.ffmeta
+    -map_metadata 1` consumes, so a library can *write* chapters without shipping a muxer.
+  - MP4Box's and `mp4chaps`' `CHAPTER01`/`CHAPTER01NAME` form.
+  - Bare `h:mm:ss[.ms] name` timecodes.
+  - ZoomPlayer's `AddChapter`, `AddChapterBySeconds` and `AddChapterByTime`.
+
+  Writers emit all three of the first, so the same chapter list can be handed to ffmpeg
+  or to MP4Box.
+- **`SidecarWarning`** — every warning here is a file a human edited and got nearly
+  right, and reporting them turns a silently wrong chapter list into a fixable one.
+  Worth knowing about:
+  - `WhitespaceInKey` — a stray space before an `=` makes ffmpeg read the key as `START `
+    and **discard the chapter's title**. Verified against ffmpeg: the chapter appears
+    with an empty title and only a warning on stderr.
+  - `NoTimebase` — with no `TIMEBASE`, ffmpeg reads `START`/`END` as **nanoseconds**.
+    Verified by muxing `END=60000000000` and reading back 60 s; some older copies of the
+    documentation say milliseconds, which would make it a 60 000-second chapter.
+  - `TrailingBackslash` — see below.
+- **`ffmpeg_reads_back(title)`** — whether a title survives a round trip through ffmpeg.
+- **`MergeStrategy`** — `KeepTimestamps` (the default), `ReplaceAll` and
+  `SkipOnMismatch`, for applying a sidecar to a title that already has chapters.
+- **`SidecarChapters::duration_ms`** — lets a caller give the last chapter a real `END`
+  instead of one equal to its own `START`.
+
+### Fixed
+
+- **A title ending in a backslash is now detected rather than silently corrupting a
+  file.** ffmpeg's reader takes the escaped pair as a line continuation and swallows the
+  *next* line: the following `[CHAPTER]` header disappears, the chapter count drops, and
+  the survivor reports a start time of zero. Nothing appears on stderr. This crate counts
+  backslashes instead, so all chapters survive, and reports the hazard so a caller can
+  warn before handing the file to ffmpeg. Found by the conformance harness.
+
+### Notes on the format, established by running ffmpeg rather than by reading about it
+
+- A title containing a newline is written as a backslash at the end of the line followed
+  by a real newline, and reads back as a newline. Reading the file line by line truncates
+  the title *and* then trips over the remainder as a syntax error, so the parser rejoins
+  continued lines first.
+- ffmpeg dumps the **audio** timebase (`1/44100`), not `1/1000`, so a reader that assumes
+  milliseconds places every chapter 44100x too late.
+- Whitespace in a value is significant. `foo = bar` is a tag named `foo ` with the value
+  ` bar`.
+- `AddChapter(nb_frames, name)` needs a frame rate the format does not carry. It is
+  reported rather than guessed at, because assuming 25 or 30 fps puts every chapter in
+  the wrong place.
+
 ## [0.3.0] - 2026-10-05
 
 Chapters now come from the QuickTime chapter track where a file has one, and the
@@ -88,7 +144,7 @@ Found while building the above, each caught by an invariant that did not exist b
 ## [0.1.0] - 2026-10-05
 
 First release. `audiobook-core` is the estate's L1 audiobook layer: the place
-where `id3-core` and `mp4-core` stop being container parsers and become a book.
+where `id3-core` and `mp4-core'stop being container parsers and become a book.
 
 ### Added
 

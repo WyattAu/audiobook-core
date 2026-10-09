@@ -109,20 +109,44 @@ pub fn trailing_tag_bytes(tail: &[u8]) -> u64 {
     if inner < 32 {
         return id3v1;
     }
-    let marker_at = inner - 8;
-    if tail.get(marker_at..marker_at + 8) != Some(b"APETAGEX") {
+    // The APEv2 footer is 32 bytes and *begins* with the magic: "APETAGEX", then a
+    // version, then the size, then an item count, then flags, then eight reserved bytes.
+    // This crate used to look for the magic at the footer's end and read the size from
+    // its first four bytes — both wrong, and wrong in a way that always agreed with
+    // itself: the size it found was a plausible number, and the duration derived from it
+    // was merely wrong by the tag's whole length rather than obviously broken.
+    let footer_at = inner - 32;
+    if tail.get(footer_at..footer_at + 8) != Some(b"APETAGEX") {
         return id3v1;
     }
-    let size_at = inner - 32;
-    let size = match tail.get(size_at..size_at + 4).and_then(|b| {
+    let size = match tail.get(footer_at + 12..footer_at + 16).and_then(|b| {
         let four = [b.first()?, b.get(1)?, b.get(2)?, b.get(3)?];
         Some(u32::from_le_bytes([*four[0], *four[1], *four[2], *four[3]]))
     }) {
         Some(bytes) => u64::from(bytes),
         None => return id3v1,
     };
-    let total = size.saturating_add(32);
-    if u64::try_from(inner).unwrap_or(0) < total {
+    // The declared size includes the footer, and is what mutagen reads out of the same
+    // field: a footer-only tag occupies exactly this many bytes at the end of the file.
+    // But a tag written *with* a header — which is what mutagen writes, and the flag
+    // saying so is in the footer — has those 32 bytes in front of the items too, and the
+    // size field does not count them. Leaving the header in is the same defect as leaving
+    // the footer in, one layer down: a plausible number, wrong by exactly its own cause.
+    //
+    // The flags are the footer's fourth word: magic, version, size, items, flags. Reading
+    // the third word's neighbour is how a reader ends up checking the item count for a
+    // flag, which agrees with itself on every footer whose item count is zero.
+    let flags = match tail.get(footer_at + 20..footer_at + 24).and_then(|b| {
+        let four = [b.first()?, b.get(1)?, b.get(2)?, b.get(3)?];
+        Some(u32::from_le_bytes([*four[0], *four[1], *four[2], *four[3]]))
+    }) {
+        Some(bytes) => bytes,
+        None => return id3v1,
+    };
+    let has_header = flags & 0x8000_0000 != 0;
+    let header_bytes = if has_header { 32 } else { 0 };
+    let total = size + header_bytes;
+    if u64::try_from(inner).unwrap_or(0) < total || size < 32 {
         // A size field larger than the window means the footer is not the end of this
         // file's tags, so nothing is claimed rather than a number nobody can check.
         return id3v1;
@@ -229,25 +253,65 @@ mod tests {
 
     #[test]
     fn an_ape_tag_at_the_end_is_counted_by_its_footer() {
-        // A 32-byte footer whose size field counts everything but header and footer.
-        let size = 64u32;
+        // Sixty-four bytes of items and a 32-byte footer, with the size field saying 96:
+        // the size includes the footer, which is what mutagen reads from the same field.
+        let items = vec![0u8; 64];
         let mut file = vec![0u8; 4096];
-        let at = file.len() - 32;
-        let marker = file.len() - 8;
-        file[at..at + 4].copy_from_slice(&size.to_le_bytes());
-        file[marker..].copy_from_slice(b"APETAGEX");
+        let footer_at = file.len() - 32;
+        file[footer_at - items.len()..footer_at].copy_from_slice(&items);
+        file[footer_at..].copy_from_slice(&ape_footer(96, 0));
         assert_eq!(trailing_tag_bytes(&file), 96);
+    }
+
+    /// An APEv2 footer as the spec and mutagen both read it: the magic first, then
+    /// version, size, item count and flags as little-endian words, then eight reserved
+    /// bytes. `size` counts the whole tag including this footer; `flags` is what says
+    /// whether a header sits in front of the items, which is where the reader has to
+    /// learn about it, because the size field does not count the header at all.
+    fn ape_footer(size: u32, flags: u32) -> Vec<u8> {
+        let mut footer = b"APETAGEX".to_vec();
+        footer.extend_from_slice(&2000u32.to_le_bytes());
+        footer.extend_from_slice(&size.to_le_bytes());
+        footer.extend_from_slice(&0u32.to_le_bytes());
+        footer.extend_from_slice(&flags.to_le_bytes());
+        footer.extend_from_slice(&[0u8; 8]);
+        assert_eq!(footer.len(), 32);
+        footer
+    }
+
+    /// The flag mutagen sets on a footer whose tag has a header in front of its items.
+    const HAS_HEADER: u32 = 0x8000_0000;
+
+    #[test]
+    fn a_tag_written_with_a_header_occupies_its_size_plus_the_header() {
+        // What mutagen writes: a 32-byte header, the items, and a footer whose size
+        // field counts items and footer but not the header, with HAS_HEADER set in the
+        // footer's flags. The header is as much padding-masquerading-as-audio as the
+        // rest, and leaving it in is the same defect one layer down.
+        let mut file = vec![0u8; 4096];
+        let header_at = file.len() - 32 - 50 - 32;
+        let footer_at = file.len() - 32;
+        let mut header = b"APETAGEX".to_vec();
+        header.extend_from_slice(&2000u32.to_le_bytes());
+        header.extend_from_slice(&50u32.to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(&HAS_HEADER.to_le_bytes());
+        header.extend_from_slice(&[0u8; 8]);
+        file[header_at..header_at + 32].copy_from_slice(&header);
+        // The footer carries the flag too - it is how a reader walking backwards from
+        // the end learns the header exists, since the size field never counts it.
+        file[footer_at..].copy_from_slice(&ape_footer(50 + 32, HAS_HEADER));
+        assert_eq!(trailing_tag_bytes(&file), 50 + 32 + 32);
     }
 
     #[test]
     fn both_trailing_tags_are_counted_with_id3v1_outermost() {
-        // APE first, ID3v1 last, which is the order a tagger writing both uses.
-        let size = 64u32;
+        // APE first, ID3v1 last, which is the order a tagger writing both uses - and the
+        // order mutagen checks for, seeking past the ID3v1 to find the footer behind it.
         let mut file = vec![0u8; 4096];
         let inner_end = file.len() - 128;
         let last = file.len();
-        file[inner_end - 32..inner_end - 28].copy_from_slice(&size.to_le_bytes());
-        file[inner_end - 8..inner_end].copy_from_slice(b"APETAGEX");
+        file[inner_end - 32..inner_end].copy_from_slice(&ape_footer(96, 0));
         file[last - 128..last - 125].copy_from_slice(b"TAG");
         assert_eq!(trailing_tag_bytes(&file), 96 + 128);
     }

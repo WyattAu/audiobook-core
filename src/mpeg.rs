@@ -671,6 +671,18 @@ pub fn walk(data: &[u8], kind: ContainerKind) -> Option<AudioScan> {
     }
     scan.frames_walked = frames;
     scan.variable_bitrate = !uniform_bitrate;
+    // The walk stopped where frames stopped, and a trailing ID3v1 or APE tag is where
+    // frames stop — but it is not audio. `audio_bytes` feeds the CBR duration estimate,
+    // so leaving the tag in reports every tagged book long by the tag's size: a few
+    // milliseconds on a long file, and a noticeable fraction of a short one.
+    if scan.frame_count.is_none() {
+        let window_at = data.len().saturating_sub(crate::source::TAIL_WINDOW);
+        if let Some(tail) = data.get(window_at..) {
+            scan.audio_bytes = scan
+                .audio_bytes
+                .saturating_sub(crate::source::trailing_tag_bytes(tail).min(scan.audio_bytes));
+        }
+    }
     Some(scan)
 }
 

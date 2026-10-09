@@ -338,3 +338,172 @@ fn a_file_cut_mid_tag_reports_what_it_has_rather_than_failing() {
     let windowed = MediaProbe::probe_source(&mut source);
     assert_agree(&whole, &windowed);
 }
+
+#[test]
+fn an_m4b_whose_moov_is_first_agrees_too() {
+    // `+faststart` shape, which is the mirror of everything else here: the moov sits at
+    // the *front*, where a head-only window would find it and a tail-only one would not.
+    // The walk must be indifferent to which end the metadata lives at, because muxers
+    // choose.
+    let data = m4b_with_chpl_at_head();
+    let (whole, _windowed, source) = both(&data);
+    assert_eq!(whole.duration_ms, Some(3_600_000));
+    assert_eq!(whole.chapters.len(), 2);
+    assert!(
+        source.read < 2 * audiobook_core::source::HEAD_WINDOW + 4096,
+        "read {} of {} bytes",
+        source.read,
+        data.len()
+    );
+}
+
+fn m4b_with_chpl_at_head() -> Vec<u8> {
+    use mp4_core::chapter::{Chapter, ChapterList};
+    use mp4_core::container::{container, leaf};
+    use mp4_core::moov::{FileType, MovieHeader};
+
+    let chapters = ChapterList {
+        chapters: vec![Chapter::new(0, "Opening"), Chapter::new(600_000, "Later")],
+    };
+    let moov = container(
+        *b"moov",
+        vec![
+            leaf(*b"mvhd", MovieHeader::to_payload(1000, 3_600_000)).expect("infallible"),
+            chapters.to_chpl_box(),
+        ],
+    );
+    let mut data = leaf(*b"ftyp", FileType::audiobook().to_payload())
+        .expect("infallible")
+        .to_bytes();
+    data.extend_from_slice(&moov.to_bytes());
+    data.extend_from_slice(
+        &leaf(*b"mdat", vec![0u8; 1_000_000])
+            .expect("infallible")
+            .to_bytes(),
+    );
+    data
+}
+
+#[test]
+fn an_mp4_with_a_free_box_before_its_mdat_agrees() {
+    // Padding between the boxes: a walk that assumed `ftyp` is followed by `mdat` would
+    // misread the next header by the free box's width and find nothing at all.
+    use mp4_core::chapter::{Chapter, ChapterList};
+    use mp4_core::container::{container, leaf};
+    use mp4_core::moov::{FileType, MovieHeader};
+
+    let chapters = ChapterList {
+        chapters: vec![Chapter::new(0, "Only")],
+    };
+    let mut data = leaf(*b"ftyp", FileType::audiobook().to_payload())
+        .expect("infallible")
+        .to_bytes();
+    data.extend_from_slice(
+        &leaf(*b"free", vec![0u8; 4096])
+            .expect("infallible")
+            .to_bytes(),
+    );
+    data.extend_from_slice(
+        &leaf(*b"mdat", vec![0u8; 512])
+            .expect("infallible")
+            .to_bytes(),
+    );
+    let moov = container(
+        *b"moov",
+        vec![
+            leaf(*b"mvhd", MovieHeader::to_payload(1000, 600_000)).expect("infallible"),
+            chapters.to_chpl_box(),
+        ],
+    );
+    data.extend_from_slice(&moov.to_bytes());
+
+    let (whole, _windowed, _source) = both(&data);
+    assert_eq!(whole.duration_ms, Some(600_000));
+    assert_eq!(whole.chapters.len(), 1);
+}
+
+/// A 48 kHz MP3, because its frame length is a whole number of bytes at every bitrate
+/// and no padding bit is ever set — which makes the frame arithmetic exact, so a test can
+/// state the duration it expects in closed form rather than walking the file to find out.
+// 48 kHz is sample-rate index 01: byte two is bitrate 0101 with the rate bits 01 after
+// it. The first attempt at this fixture used 0x50, whose rate bits are 00 - 44.1 kHz -
+// and its own arithmetic then disagreed with the reader, because a 44.1 kHz frame is 208
+// bytes where the fixture stepped 192. The fixture was wrong, and the disagreement was
+// the only reason anyone found out.
+const EXACT_HEADER: [u8; 4] = [0xFF, 0xFB, 0x54, 0xC4]; // 64 kbit/s mono 48 kHz
+const EXACT_FRAME_LEN: usize = 192;
+const EXACT_SAMPLES_PER_FRAME: u64 = 1152;
+const EXACT_RATE: u64 = 48_000;
+
+/// `frames` frames of audio plus a trailing tag, and the duration the audio alone is.
+fn mp3_with_trailing_tag(tag: &[u8]) -> (Vec<u8>, u64) {
+    let frames = 400u64;
+    let mut data = Vec::new();
+    for _ in 0..frames {
+        data.extend_from_slice(&EXACT_HEADER);
+        data.resize(data.len() + EXACT_FRAME_LEN - 4, 0);
+    }
+    let audio_len = data.len();
+    data.extend_from_slice(tag);
+    // frames * samples / rate, in whole milliseconds, with no rounding anywhere: 400
+    // frames of 1152 samples at 48 kHz is 9.6 s exactly.
+    let expected_ms = frames * EXACT_SAMPLES_PER_FRAME * 1_000 / EXACT_RATE;
+    let _ = audio_len;
+    (data, expected_ms)
+}
+
+#[test]
+fn an_mp3_with_only_a_trailing_id3v1_tag_agrees() {
+    // No ID3v2 at all: the tag lives at the end, where only the tail window looks, and
+    // the audio's byte count must lose those 128 bytes or the CBR duration is long by
+    // however long the tag is.
+    // An ID3v1 tag *starts* with "TAG" and is 128 bytes in total; writing the magic last
+    // builds no tag a tagger would recognise, and the reader correctly finds none.
+    let mut tag = b"TAG".to_vec();
+    tag.extend_from_slice(&[0u8; 125]);
+    let (data, expected_ms) = mp3_with_trailing_tag(&tag);
+    let whole = MediaProbe::probe(&data);
+    assert_eq!(
+        whole.duration_ms,
+        Some(expected_ms),
+        "128 bytes of tag are not 128 bytes of audio"
+    );
+    let (_whole, _windowed, _source) = both(&data);
+}
+
+#[test]
+fn an_mp3_with_a_trailing_ape_tag_agrees() {
+    // APE tags are what MusicBrainz taggers write, and they are bigger than ID3v1 by far
+    // — long enough that leaving one in the audio byte count is visible in minutes.
+    // Sixty-four bytes of items and a 32-byte footer whose size field says 96, which is
+    // the layout mutagen writes and reads: magic first, size at offset twelve.
+    let mut tag = vec![0u8; 64];
+    tag.extend_from_slice(b"APETAGEX");
+    tag.extend_from_slice(&2000u32.to_le_bytes());
+    tag.extend_from_slice(&96u32.to_le_bytes());
+    tag.extend_from_slice(&0u32.to_le_bytes());
+    tag.extend_from_slice(&0u32.to_le_bytes());
+    tag.extend_from_slice(&[0u8; 8]);
+    let (data, expected_ms) = mp3_with_trailing_tag(&tag);
+    let whole = MediaProbe::probe(&data);
+    assert_eq!(whole.duration_ms, Some(expected_ms));
+    let (_whole, _windowed, _source) = both(&data);
+}
+
+#[test]
+fn debug_tail() {
+    let mut tag = vec![0u8; 125];
+    tag.extend_from_slice(b"TAG");
+    let (data, _e) = mp3_with_trailing_tag(&tag);
+    let n = data.len();
+    let tail = &data[n - 8192..];
+    println!(
+        "tail len={} last16={:?}",
+        tail.len(),
+        &tail[tail.len() - 16..]
+    );
+    println!(
+        "trailing(8192)={}",
+        audiobook_core::source::trailing_tag_bytes(tail)
+    );
+}

@@ -75,6 +75,37 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
   as tagless: no title, no chapters, no duration. Found by the equivalence gate the same
   hour it was written, which is the argument for the gate.
 
+### Fixed
+
+- **A trailing APE tag was counted as audio — twice over.** Two defects, both found by
+  asserting the windowed and whole-file probes agree:
+
+  - The whole-file walk stopped where frames stopped, but left a trailing ID3v1 or APE tag
+    in the byte count that feeds the constant-bitrate duration estimate. Every tagged book
+    was reported long by the tag's size: a few milliseconds on a long file, a noticeable
+    fraction of a short one.
+  - The APE detection itself was wrong at both ends of the footer. The footer *begins*
+    with the magic — this crate looked for it at the end — and its size field sits at
+    offset twelve, not zero. Both were wrong in a way that always agreed with itself: the
+    size it found was a plausible number, so the duration was merely wrong by the tag's
+    whole length rather than obviously broken. And the size field does not count the
+    32-byte *header* a tagger writes in front of the items; the flag saying one exists is
+    in the footer, one word past where this crate was looking — so the first fix read the
+    item count as a flag and agreed with itself again.
+
+  Verified against a tag written by mutagen on a real file: the whole occupied extent —
+  header, items, footer — is now excluded, and the duration matches ffprobe to the
+  millisecond.
+
+### Documented divergence
+
+- **On a constant-bitrate MP3 with no declared frame count, this crate's duration estimate
+  excludes a trailing tag and ffprobe's includes it.** Both are estimates — the format has
+  no duration anywhere — but they differ by the tag's size, which is a few milliseconds at
+  audiobook bitrates and therefore invisible inside any sane tolerance. The crate's number
+  is the closer one to the audio; the divergence is recorded in the conformance harness's
+  unchecked fields so a green run there cannot be read as saying the two agree.
+
 ## [0.5.0] - 2026-10-06
 
 No API change; a behaviour change inherited from `id3-core`, and a big one for MP3.

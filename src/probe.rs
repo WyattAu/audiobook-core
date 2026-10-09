@@ -105,6 +105,14 @@ pub struct MediaProbe {
     /// source — and a library that silently prefers one shows the user a list the file
     /// contradicts. Reporting it costs nothing and lets a caller decide.
     pub chapter_disagreement: Option<ChapterDisagreement>,
+    /// Whether the encoder's own delay and padding were taken out of the duration.
+    ///
+    /// `false` means the duration is the length of the samples the file *holds*, which
+    /// for an MP3 is a little longer than the audio in it. Every MP3 has that gap and
+    /// most are small, but a caller comparing durations against a player needs to know
+    /// whether the two are expected to agree: this flag is the answer, and defaulting it
+    /// to `true` would let an MP4 claim a trim that no MP4 has.
+    pub encoder_trim_applied: bool,
 }
 
 /// A disagreement between a file's two chapter mechanisms.
@@ -237,8 +245,9 @@ impl MediaProbe {
         probe.frame_count = audio.frame_count;
         probe.variable_bitrate = Some(audio.variable_bitrate);
 
-        if let Some(frames) = audio.frame_count {
-            let ms = audio.samples_from_frames(frames);
+        if audio.frame_count.is_some() {
+            probe.encoder_trim_applied = audio.encoder_trim_applied;
+            let ms = audio.trimmed_duration_ms();
             probe.duration_ms = Some(ms);
             probe.confidence = Confidence::Declared;
             // A declared frame count makes the bitrate exact too: total bytes

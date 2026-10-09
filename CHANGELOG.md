@@ -3,6 +3,57 @@
 All notable changes to this project are documented here. Format: [Keep a
 Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
 
+### Fixed
+
+- **An MP3's duration ignored the encoder's own delay and padding.** Every MP3 starts
+  with a fixed encoder delay and is padded out to a whole frame, so the samples a file
+  holds are longer than the audio in it, and LAME records both numbers in a tag at the
+  end of the Xing/Info header. The reader ignored the tag, so every book was reported
+  slightly longer than it is.
+
+  Verified against ffmpeg on six files spanning mono and stereo, CBR and VBR, and
+  MPEG-1 and MPEG-2: all six now match ffprobe's duration to the millisecond, where
+  before all six were ~30 ms long. mutagen is wrong on all six — it requires the literal
+  string `LAME` and ffmpeg writes `Lavc`, `Lavf` or `L3.99`, so it silently reports the
+  untrimmed figure. All four are accepted here.
+
+- **The MPEG-2 side-information width was one byte short, which cost 44% of the
+  duration on the commonest audiobook encoding.** The offset of a Xing/Info tag from the
+  start of its frame comes from the side-information width: 17 and 32 bytes for MPEG-1
+  mono and stereo, 9 and 17 for MPEG-2. The MPEG-2 rows were 8 and 16. Reading them one
+  byte short does not fail loudly — the tag simply reads as *absent*, so a file with a
+  perfectly good frame count falls back to estimating the duration from a bitrate, and
+  the bitrate it reads is the placeholder in the very frame the tag lives in.
+
+  A 12-second 22.05 kHz mono audiobook — the encoding a spoken-word book actually ships
+  in — was reported as 6.9 seconds, with a bitrate of 56 kbit/s against 32 kbit/s of real
+  audio. It now reports 12.000 s and 32182 bps.
+
+- **The declared byte count was used without removing the frame the tag lives in.**
+  Xing's byte count covers that frame and its frame count does not, so every bitrate
+  derived from the pair was one frame too large. Invisible on a long book, most of the
+  error on a short one.
+
+### Added
+
+- **`LameTag`, `VBRITAG_OFFSET`, `AudioScan::samples_of` and `trimmed_duration_ms`**, so a
+  caller can see *why* a duration is the length it is rather than only how long.
+- **`MediaProbe::encoder_trim_applied`**, which is `false` for an MP4 and for an MP3 whose
+  encoder said nothing. Defaulting it to `true` would let a container claim a trim no
+  container has, so a caller comparing against a player can tell whether agreement was
+  expected.
+- **`examples/probecmp.rs`**, which prints a probe's verdict for a list of files. Every
+  number it shows was compared by hand against ffprobe; the comparison is written down in
+  this file rather than asserted in the example.
+
+### Verified, and deliberately not done
+
+- **A trim as long as the audio it describes is ignored rather than subtracted.** Old LAME
+  versions wrote delay and padding on short, low-bitrate files that held no audio at all,
+  and subtracting them reports a zero-length book. The untrimmed count stands and
+  `encoder_trim_applied` stays `false`: a duration a few milliseconds wrong beats one that
+  is empty, and the flag is how a caller finds out which it has.
+
 ## [0.5.0] - 2026-10-06
 
 No API change; a behaviour change inherited from `id3-core`, and a big one for MP3.

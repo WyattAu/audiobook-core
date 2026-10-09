@@ -380,8 +380,16 @@ fn a_vbr_mp3_probes_to_an_exact_duration() {
     assert_eq!(p.title.as_deref(), Some("Tagged"));
     assert_eq!(p.chapters.len(), 2);
     assert_eq!(p.chapters[1], (60_000u64, "Second".to_string()));
-    // 957 * 417 = 399_069 bytes over 24.999 s.
-    assert_eq!(p.bitrate_bps, Some(127_707));
+    // The fixture declares `n_frames * 417` bytes, which counts the frame the tag
+    // lives in; the frame count does not, so the reader takes one frame out before
+    // dividing the two. 956 * 417 = 398_652 bytes over 24.999 s. The 0.1% difference
+    // is the whole disagreement between the two conventions, and it is why the
+    // subtraction is done rather than left to whichever number arrives first.
+    assert_eq!(p.bitrate_bps, Some(127_573));
+    assert!(
+        !p.encoder_trim_applied,
+        "no LAME tag, so no trim and none claimed"
+    );
 }
 
 #[test]

@@ -97,6 +97,7 @@ pub mod error;
 pub mod mpeg;
 pub mod probe;
 pub mod sidecar;
+pub mod source;
 pub mod title;
 
 pub use chapter::{Chapter, ChapterSource, Part};

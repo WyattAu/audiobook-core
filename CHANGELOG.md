@@ -54,6 +54,27 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
   `encoder_trim_applied` stays `false`: a duration a few milliseconds wrong beats one that
   is empty, and the flag is how a caller finds out which it has.
 
+### Changed
+
+- **`probe_source` — the same probe, through bounded reads.** An MP3's whole story is in
+  its first few kilobytes — tag, first frame, and the Xing/Info/LAME headers inside that
+  frame — so the reads are bounded by the tag's own declared size plus one frame. An MP4's
+  duration, metadata and `chpl` list are in its `moov`, which `read_top_level` finds by
+  reading box headers only; the chapter track's samples are then fetched one bounded read
+  each. No path holds a whole file, whatever its size, and every field agrees with
+  [`MediaProbe::probe`] on the same file — asserted by tests, because a windowed reader
+  that produced a *plausible* answer rather than the right one would be worse than the
+  slow path it replaces.
+
+### Fixed
+
+- **The windowed MP3 path searched the audio window for a second ID3 tag it had already
+  passed.** `first_frame` takes a container kind and skips a tag when it sees one, and the
+  windowed path handed it the audio *after* the tag while telling it the file was tagged —
+  so `find_id3v2` found nothing, `first_frame` returned nothing, and every tagged MP3 read
+  as tagless: no title, no chapters, no duration. Found by the equivalence gate the same
+  hour it was written, which is the argument for the gate.
+
 ## [0.5.0] - 2026-10-06
 
 No API change; a behaviour change inherited from `id3-core`, and a big one for MP3.

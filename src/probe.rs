@@ -37,6 +37,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::container::{self, ContainerKind};
+use crate::source::{read_head, read_tail, read_window, AUDIO_WINDOW, MAX_TAG_BYTES};
 
 /// How much to trust a reported duration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -148,6 +149,271 @@ impl MediaProbe {
             Some(ContainerKind::Mp3Bare) => Self::probe_mp3(data),
             None => Self::default(),
         }
+    }
+
+    /// Probe a file through bounded reads, for a caller that does not hold the file.
+    ///
+    /// # What is bounded, and what is not
+    ///
+    /// An MP3's whole story is in its first few kilobytes — tag, first frame, and the
+    /// Xing/Info/LAME headers inside that frame — so the reads are bounded by the tag's
+    /// own declared size plus one frame. An MP4's duration, metadata and `chpl` list are
+    /// in its `moov`, which `read_top_level` finds by reading box *headers* only, so a
+    /// 2 GB `mdat` costs sixteen bytes; the chapter track's samples are then fetched one
+    /// bounded read each. No path here holds a whole file, whatever its size.
+    ///
+    /// Every field agrees with [`MediaProbe::probe`] on the same file — that is asserted
+    /// by tests, because a windowed reader that produced a *plausible* answer rather than
+    /// the right one would be worse than the slow path it replaces.
+    #[must_use]
+    pub fn probe_source(source: &mut impl mp4_core::ByteReader) -> Self {
+        let head = read_head(source);
+        let Some(kind) = container::detect(&head) else {
+            return Self::default();
+        };
+        match kind {
+            ContainerKind::Mp4 => Self::probe_mp4_source(source, &head),
+            // The head is passed in rather than read again: the windowed path's whole
+            // point is what it does *not* read, and reading the same 16 KB twice to save
+            // an argument would be a strange way to keep that promise.
+            ContainerKind::Mp3Id3 | ContainerKind::Mp3Bare => {
+                Self::probe_mp3_source(source, kind, &head)
+            }
+        }
+    }
+
+    /// Probe an MP4 by locating its `moov` and reading that.
+    #[must_use]
+    fn probe_mp4_source(source: &mut impl mp4_core::ByteReader, head: &[u8]) -> Self {
+        let total = source.byte_len().unwrap_or(0);
+        // `ftyp` is inside the head window by construction: it is the file's first box.
+        let ftyp_payload: Option<alloc::vec::Vec<u8>> =
+            head.get(4..8).filter(|t| *t == b"ftyp").and_then(|_| {
+                let size = u32::from_be_bytes([
+                    *head.first()?,
+                    *head.get(1)?,
+                    *head.get(2)?,
+                    *head.get(3)?,
+                ]);
+                let size = usize::try_from(size).ok()?;
+                head.get(8..size.max(8)).map(<[u8]>::to_vec)
+            });
+
+        let Ok(top) = mp4_core::io::read_top_level(source, total) else {
+            return Self {
+                container: Some(ContainerKind::Mp4),
+                ..Self::default()
+            };
+        };
+        let Some(moov_at) = top.iter().find(|b| b.box_type == *b"moov") else {
+            return Self {
+                container: Some(ContainerKind::Mp4),
+                ..Self::default()
+            };
+        };
+        let Ok(moov_bytes) = mp4_core::io::read_box(source, moov_at) else {
+            return Self {
+                container: Some(ContainerKind::Mp4),
+                ..Self::default()
+            };
+        };
+        let Ok(parsed) = mp4_core::container::parse_boxes(&moov_bytes) else {
+            return Self {
+                container: Some(ContainerKind::Mp4),
+                ..Self::default()
+            };
+        };
+        let moov = parsed.first();
+        let file = mp4_core::Mp4File::parse_from(ftyp_payload.as_deref(), moov, source);
+        let mut probe = Self::from_mp4_file(&file);
+        // The sample rate lives in the `stsd` entry inside the moov, so the windowed
+        // path reads it there rather than through the whole-file helper.
+        if let Some(rate) = moov.and_then(mp4_core::read_sample_rate_in) {
+            probe.sample_rate = Some(rate);
+        }
+        // And the bitrate from the `mdat` sizes the walk already knows, so neither path
+        // has to look inside one.
+        let mdat: u64 = top
+            .iter()
+            .filter(|b| b.box_type == *b"mdat")
+            .map(|b| b.size.saturating_sub(b.header_len))
+            .sum();
+        if let (Some(duration_ms), true) = (probe.duration_ms, mdat > 0) {
+            probe.bitrate_bps = bitrate_bps(mdat, duration_ms);
+        }
+        probe
+    }
+
+    /// The fields of a summary, from an already-parsed MP4.
+    ///
+    /// Shared by the whole-file and windowed paths so the two cannot disagree about what
+    /// a field *means* — only about where the bytes came from.
+    #[must_use]
+    fn from_mp4_file(file: &mp4_core::Mp4File) -> Self {
+        let probe = Self {
+            container: Some(ContainerKind::Mp4),
+            duration_ms: file.duration_ms(),
+            confidence: if file.duration_ms().is_some() {
+                Confidence::Declared
+            } else {
+                Confidence::Unknown
+            },
+            title: file.metadata.text(mp4_core::atoms::TITLE).map(String::from),
+            artist: file
+                .metadata
+                .text(mp4_core::atoms::ARTIST)
+                .map(String::from),
+            album: file.metadata.text(mp4_core::atoms::ALBUM).map(String::from),
+            year: file.metadata.text(mp4_core::atoms::YEAR).map(String::from),
+            track: file.metadata.track_number(),
+            cover: file.metadata.cover().map(<[u8]>::to_vec),
+            chapters: file
+                .effective_chapters()
+                .chapters
+                .iter()
+                .map(|c| (c.start_ms, c.title.clone()))
+                .collect(),
+            chapter_disagreement: chapter_mechanisms(file),
+            ..Self::default()
+        };
+        probe
+    }
+
+    /// Probe an MP3 through bounded reads.
+    ///
+    /// The tag is read whole — a chapter frame can sit after the cover art, so half a tag
+    /// is worse than no tag — and then one frame's worth of audio, which holds every
+    /// header the duration comes from.
+    #[must_use]
+    fn probe_mp3_source(
+        source: &mut impl mp4_core::ByteReader,
+        kind: ContainerKind,
+        head: &[u8],
+    ) -> Self {
+        let total = source.byte_len().unwrap_or(0);
+
+        // The tag's own declared size, from its header, decides how much to read. A tag
+        // longer than the head window is re-read to its full size; one beyond the cap is
+        // read to the cap and the frames past it are absent, not guessed at.
+        let tag_len: u64 = if head.get(..3) == Some(b"ID3") {
+            let size = id3_core::synchsafe::decode_value([
+                *head.get(6).unwrap_or(&0),
+                *head.get(7).unwrap_or(&0),
+                *head.get(8).unwrap_or(&0),
+                *head.get(9).unwrap_or(&0),
+            ]);
+            (u64::from(size) + 10).min(MAX_TAG_BYTES)
+        } else {
+            0
+        };
+        let tag_bytes = read_window(source, 0, usize::try_from(tag_len).unwrap_or(0));
+        let audio_start = u64::try_from(tag_bytes.len()).unwrap_or(0);
+
+        let mut probe = Self {
+            container: Some(kind),
+            ..Self::default()
+        };
+        if let Ok(tag) = id3_core::Tag::parse(&tag_bytes) {
+            probe.title = tag.text_field(id3_core::TextField::Title).map(String::from);
+            probe.artist = tag
+                .text_field(id3_core::TextField::Artist)
+                .map(String::from);
+            probe.album = tag.text_field(id3_core::TextField::Album).map(String::from);
+            probe.year = tag.text_field(id3_core::TextField::Year).map(String::from);
+            probe.track = tag
+                .text_field(id3_core::TextField::Track)
+                .and_then(parse_leading_number);
+            if let Some(pic) = tag.cover() {
+                probe.cover = Some(pic.data.clone());
+            }
+            probe.chapters = container::mp3_chapters(&tag_bytes);
+        }
+
+        // One frame's worth of audio, which carries the first frame header and the
+        // Xing/Info/LAME headers inside it.
+        let audio = read_window(source, audio_start, AUDIO_WINDOW);
+        // `Mp3Bare`, not `kind`: the tag has already been read off above, so looking for
+        // another one inside the audio window would be the bug that makes every tagged
+        // file report nothing. This is exactly what the equivalence gate caught.
+        let Some((first, header)) = crate::mpeg::first_frame(&audio, ContainerKind::Mp3Bare) else {
+            return probe;
+        };
+        probe.sample_rate = Some(header.sample_rate);
+        probe.channels = Some(header.channels);
+        probe.bitrate_bps = Some(u64::from(header.bitrate_bps));
+
+        // A declared count, if the encoder wrote one — the only exact source.
+        let vbr_off = crate::mpeg::vbr_tag_offset(header.version, header.channels);
+        let declared =
+            crate::mpeg::parse_vbr(&audio, first.saturating_add(vbr_off)).or_else(|| {
+                crate::mpeg::parse_vbr(&audio, first.saturating_add(crate::mpeg::VBRI_TAG_OFFSET))
+            });
+
+        let Some(v) = declared.filter(|v| v.frames.filter(|f| *f > 0).is_some()) else {
+            // No declared count: the duration follows from the bitrate and the bytes,
+            // which is the same derivation the whole-file path makes — it just does not
+            // have to walk every frame to get there. `frame_count` stays `None` so
+            // nothing downstream can mistake the estimate for a count.
+            probe.variable_bitrate = Some(false);
+            let tail = read_tail(source, total);
+            let trailing = crate::source::trailing_tag_bytes(&tail);
+            let audio_bytes = total.saturating_sub(audio_start).saturating_sub(trailing);
+            if header.bitrate_bps > 0 {
+                probe.bitrate_bps = Some(u64::from(header.bitrate_bps));
+                probe.duration_ms =
+                    duration_from_bitrate(audio_bytes, u64::from(header.bitrate_bps));
+                probe.confidence = Confidence::Derived;
+            }
+            return probe;
+        };
+
+        let Some(frames) = v.frames.filter(|f| *f > 0) else {
+            return probe;
+        };
+        let mut scan = crate::mpeg::AudioScan {
+            header: Some(header),
+            frame_count: Some(frames),
+            frames_walked: 0,
+            // The declared byte count covers the frame the tag lives in, which the frame
+            // count does not; where the encoder said nothing, the tail says how much of
+            // the file was not audio.
+            audio_bytes: match v.bytes.filter(|b| *b > 0) {
+                Some(b) => b.saturating_sub(u64::try_from(header.frame_len()).unwrap_or(0)),
+                None => {
+                    // The tail is read only when a declared byte count is missing,
+                    // because its only job here is to say how much of the file was not
+                    // audio.
+                    let tail = read_tail(source, total);
+                    let trailing = crate::source::trailing_tag_bytes(&tail);
+                    total.saturating_sub(audio_start).saturating_sub(trailing)
+                }
+            },
+            sample_rate: header.sample_rate,
+            channels: header.channels,
+            bitrate_bps: u64::from(header.bitrate_bps),
+            variable_bitrate: v.is_xing.unwrap_or(true),
+            encoder_delay_samples: 0,
+            encoder_padding_samples: 0,
+            encoder_trim_applied: false,
+        };
+        if let Some(lame) = v.lame {
+            let trim = lame.trim_samples();
+            let held = scan.samples_of(frames);
+            if trim > 0 && trim < held {
+                scan.encoder_delay_samples = u32::from(lame.delay_samples);
+                scan.encoder_padding_samples = u32::from(lame.padding_samples);
+                scan.encoder_trim_applied = true;
+            }
+        }
+        probe.frame_count = scan.frame_count;
+        probe.variable_bitrate = Some(scan.variable_bitrate);
+        probe.encoder_trim_applied = scan.encoder_trim_applied;
+        probe.duration_ms = Some(scan.trimmed_duration_ms());
+        probe.confidence = Confidence::Declared;
+        if scan.duration_ms() > 0 {
+            probe.bitrate_bps = bitrate_bps(scan.audio_bytes, scan.duration_ms());
+        }
+        probe
     }
 
     /// Probe an ISO base media file.

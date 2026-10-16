@@ -245,22 +245,105 @@ pub fn parse_header(data: &[u8]) -> Option<FrameHeader> {
 
 /// The offset of a Xing or Info tag from the start of its frame.
 ///
-/// Side-information width is what makes this a table: MPEG-1 stereo has 32
-/// bytes of it, MPEG-2/2.5 mono has 8, and everything in between differs.
+/// Side-information width is what makes this a table, and the widths come from
+/// ISO/IEC 11172-3 table B.1: MPEG-1 carries 17 bytes mono and 32 stereo; MPEG-2
+/// and 2.5 carry 9 and 17. Adding the four-byte frame header gives 21, 36, 13 and
+/// 21.
+///
+/// The widths are easy to get wrong by one, and getting them wrong is quiet
+/// rather than loud: a tag one byte out of reach reads as *absent*, so a file
+/// with a perfectly good frame count falls back to an estimate made from a
+/// bitrate. The frame that estimate reads the bitrate from is the very frame the
+/// encoder wrote to carry the tag, and that frame's bitrate field is a
+/// placeholder. For a 22.05 kHz mono audiobook - the commonest spoken-word
+/// encoding there is - the placeholder read 56 kbit/s against 32 kbit/s of real
+/// audio, and the duration came out 44% short with nothing to say so.
 #[must_use]
 pub fn vbr_tag_offset(version: MpegVersion, channels: u16) -> usize {
-    // Layer I has no side information at all; the header is immediately
-    // followed by the (unused here) payload, so 4 is the correct answer for it.
+    const HEADER: usize = 4;
     if version.is_v1() {
         if channels == 1 {
-            4 + 17
+            HEADER + 17
         } else {
-            4 + 32
+            HEADER + 32
         }
     } else if channels == 1 {
-        4 + 8
+        HEADER + 9
     } else {
-        4 + 16
+        HEADER + 17
+    }
+}
+
+/// The offset of a VBRI tag from the start of its frame.
+///
+/// Always 36, whatever the version or channel count: Fraunhofer's tag sits at a
+/// fixed distance, which is why a reader that looks only at the Xing offset
+/// misses every VBRI file encoded for MPEG-2.
+pub const VBRI_TAG_OFFSET: usize = 36;
+
+/// The encoder's own account of samples it added at the start and end.
+///
+/// Every MP3 begins with a fixed encoder delay and is padded out to a whole number of
+/// frames, so the samples a file *holds* are longer than the audio a player should
+/// *play*. LAME records both numbers, and a reader that ignores them reports every book
+/// as slightly longer than it is.
+///
+/// Four different version strings appear in the wild and all of them mean the same
+/// thing, so all four are accepted: `LAME3.100` from LAME itself, `Lavf58` and
+/// `Lavc58` from ffmpeg's muxer and encoder respectively, and `L3.99` from LAME's
+/// older names. Requiring the literal `LAME` prefix — as mutagen does — is how a reader
+/// silently reports 31 ms of silence at the end of every ffmpeg-encoded book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LameTag {
+    /// Samples of encoder delay at the start of the file.
+    pub delay_samples: u16,
+    /// Samples of padding at the end of the file.
+    pub padding_samples: u16,
+}
+
+impl LameTag {
+    /// Whether the extended header's revision nibble is one this crate understands.
+    ///
+    /// A non-zero revision means the layout past this point may be different, and
+    /// reading a delay out of it would be a guess wearing a number's clothes.
+    #[must_use]
+    fn revision_is_known(tag: &[u8]) -> bool {
+        tag.get(9).map(|b| b >> 4 == 0).unwrap_or(false)
+    }
+
+    /// Whether `version` is one of the four encoder strings this crate accepts.
+    #[must_use]
+    fn version_is_known(version: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 4] = [b"LAME", b"Lavf", b"Lavc", b"L3.99"];
+        PREFIXES.iter().any(|prefix| version.starts_with(prefix))
+    }
+
+    /// Parse the LAME extended header at `offset` in `data`.
+    ///
+    /// `None` for anything that is not a recognised LAME header — an absent header is
+    /// not an error, it just means the encoder did not say.
+    #[must_use]
+    pub fn parse(data: &[u8], offset: usize) -> Option<LameTag> {
+        let tag = data.get(offset..offset + 24)?;
+        let version = tag.get(..9)?;
+        if !Self::version_is_known(version) || !Self::revision_is_known(tag) {
+            return None;
+        }
+        // Bytes 21..24 pack the two counts: twelve bits of delay, then twelve of
+        // padding, high nibble first.
+        let b21 = u16::from(*tag.get(21)?);
+        let b22 = u16::from(*tag.get(22)?);
+        let b23 = u16::from(*tag.get(23)?);
+        Some(LameTag {
+            delay_samples: (b21 << 4) | (b22 >> 4),
+            padding_samples: ((b22 & 0x0F) << 8) | b23,
+        })
+    }
+
+    /// Total samples this tag says are not audio.
+    #[must_use]
+    pub fn trim_samples(self) -> u64 {
+        u64::from(self.delay_samples) + u64::from(self.padding_samples)
     }
 }
 
@@ -276,6 +359,8 @@ pub struct VbrHeader {
     /// Info means the encoder wrote the header on a CBR stream, so treating it as
     /// VBR mislabels the file.
     pub is_xing: Option<bool>,
+    /// The encoder's declared delay and padding, when it left a LAME header.
+    pub lame: Option<LameTag>,
 }
 
 /// Parse a Xing, Info, or VBRI header sitting at `offset` in `data`.
@@ -317,12 +402,23 @@ fn parse_xing_body(body: &[u8], is_xing: bool) -> VbrHeader {
             .get(cursor..cursor + 4)
             .and_then(|b| <[u8; 4]>::try_from(b).ok())
             .map(|b| u64::from(u32::from_be_bytes(b)));
+        cursor += 4;
+    }
+    // Every optional field is skipped even when absent, because the LAME header is
+    // positioned by the flags rather than by its own presence: a reader that looked for
+    // `LAME` right after the byte count would find it on some files and not others.
+    if flags & 0b0100 != 0 {
+        cursor += 100; // seek table
+    }
+    if flags & 0b1000 != 0 {
+        cursor += 4; // VBR quality
     }
 
     VbrHeader {
         frames,
         bytes,
         is_xing: Some(is_xing),
+        lame: LameTag::parse(body, cursor),
     }
 }
 
@@ -344,6 +440,10 @@ fn parse_vbri_body(body: &[u8]) -> VbrHeader {
         frames,
         bytes,
         is_xing: None,
+        // A VBRI header has a delay field of its own, but Fraunhofer writes zero there
+        // and mutagen does not subtract it either, so reading it would be a second
+        // guess about a field no tool in the estate can corroborate.
+        lame: None,
     }
 }
 
@@ -366,9 +466,36 @@ pub struct AudioScan {
     pub channels: u16,
     /// The bitrate every frame declared, when they all agreed.
     pub bitrate_bps: u64,
+    /// Samples the encoder says it added before the audio.
+    pub encoder_delay_samples: u32,
+    /// Samples the encoder says it added after the audio.
+    pub encoder_padding_samples: u32,
+    /// Whether the encoder's delay and padding were applied.
+    ///
+    /// False when the encoder declared none, and false when what it declared is at
+    /// least as long as the file it is describing — which happens on short files at
+    /// low bitrates, where old LAME versions wrote delay and padding for a file that
+    /// held no audio at all. Subtracting those would report a zero-length book, so
+    /// they are ignored and the untrimmed count stands. `false` here means the number
+    /// is not known to be the length of the *audio*; it does not mean the audio is
+    /// missing.
+    pub encoder_trim_applied: bool,
 }
 
 impl AudioScan {
+    /// The samples a frame count holds, before any encoder trim.
+    ///
+    /// Kept separate from the millisecond conversion so the trim is subtracted in
+    /// samples rather than in rounded milliseconds: trimming after rounding would make
+    /// a one-frame trim disappear on a short file.
+    #[must_use]
+    pub fn samples_of(&self, frames: u64) -> u64 {
+        let Some(h) = self.header else {
+            return 0;
+        };
+        frames.saturating_mul(h.layer.samples_per_frame(h.version) as u64)
+    }
+
     /// Duration in milliseconds from a frame count.
     ///
     /// Returns `0` when there is nothing to compute from, rather than guessing.
@@ -377,11 +504,37 @@ impl AudioScan {
         let Some(h) = self.header else {
             return 0;
         };
-        let per_frame = h.layer.samples_per_frame(h.version) as u64;
         if h.sample_rate == 0 {
             return 0;
         }
-        frames.saturating_mul(per_frame).saturating_mul(1_000) / u64::from(h.sample_rate)
+        self.samples_of(frames).saturating_mul(1_000) / u64::from(h.sample_rate)
+    }
+
+    /// The length of the audio, in milliseconds, with the encoder's own trim applied.
+    ///
+    /// This is the number a player shows and the number ffmpeg reports: the declared
+    /// frame count, less the samples the encoder admits it added at each end.
+    #[must_use]
+    pub fn trimmed_duration_ms(&self) -> u64 {
+        let frames = self.frame_count.unwrap_or(self.frames_walked);
+        let raw = self.samples_of(frames);
+        if !self.encoder_trim_applied {
+            return self.samples_to_ms(raw);
+        }
+        let trim = u64::from(self.encoder_delay_samples) + u64::from(self.encoder_padding_samples);
+        self.samples_to_ms(raw.saturating_sub(trim))
+    }
+
+    /// Milliseconds from a sample count at the stream's declared rate.
+    #[must_use]
+    fn samples_to_ms(&self, samples: u64) -> u64 {
+        let Some(h) = self.header else {
+            return 0;
+        };
+        if h.sample_rate == 0 {
+            return 0;
+        }
+        samples.saturating_mul(1_000) / u64::from(h.sample_rate)
     }
 
     /// Duration in milliseconds.
@@ -392,7 +545,7 @@ impl AudioScan {
     /// `frames_walked` is 0 there and using it would report a zero-length file.
     #[must_use]
     pub fn duration_ms(&self) -> u64 {
-        self.samples_from_frames(self.frame_count.unwrap_or(self.frames_walked))
+        self.trimmed_duration_ms()
     }
 }
 
@@ -435,9 +588,20 @@ pub fn walk(data: &[u8], kind: ContainerKind) -> Option<AudioScan> {
     let audio_start = start;
     let audio_len = data.len().saturating_sub(start);
 
-    // A declared count, if the encoder wrote one.
-    let vbr_off = vbr_tag_offset(header.version, header.channels);
-    let declared = parse_vbr(data, audio_start.saturating_add(vbr_off));
+    // A declared count, if the encoder wrote one. Only Layer III carries a Xing, Info
+    // or LAME tag; the other layers put nothing but audio where a tag could go, so
+    // looking there would read a coincidental byte sequence as a frame count.
+    let declared = if header.layer == Layer::Layer3 {
+        let xing = parse_vbr(
+            data,
+            audio_start.saturating_add(vbr_tag_offset(header.version, header.channels)),
+        );
+        // VBRI sits at its own fixed distance, so it is a second attempt rather than
+        // an alternative to the same offset.
+        xing.or_else(|| parse_vbr(data, audio_start.saturating_add(VBRI_TAG_OFFSET)))
+    } else {
+        None
+    };
 
     let mut scan = AudioScan {
         header: Some(header),
@@ -456,7 +620,25 @@ pub fn walk(data: &[u8], kind: ContainerKind) -> Option<AudioScan> {
             // count on a constant-rate stream. VBRI does not distinguish.
             scan.variable_bitrate = v.is_xing.unwrap_or(true);
             if let Some(bytes) = v.bytes.filter(|b| *b > 0) {
-                scan.audio_bytes = bytes;
+                // The declared byte count covers the header frame, which the frame
+                // count does not. Leaving it in makes every bitrate derived from the
+                // pair one frame too large, which for a short file is most of the
+                // error and for a long one is invisible — the kind of defect that
+                // hides in exactly the files nobody checks.
+                let first_frame = u64::try_from(header.frame_len()).unwrap_or(0);
+                scan.audio_bytes = bytes.saturating_sub(first_frame);
+            }
+            if let Some(lame) = v.lame {
+                let trim = lame.trim_samples();
+                let held = scan.samples_of(frames);
+                // A trim as long as the audio it describes is not a trim; it is a
+                // broken header. Ignoring it keeps the untrimmed count, which is
+                // wrong by a few milliseconds rather than empty.
+                if trim > 0 && trim < held {
+                    scan.encoder_delay_samples = u32::from(lame.delay_samples);
+                    scan.encoder_padding_samples = u32::from(lame.padding_samples);
+                    scan.encoder_trim_applied = true;
+                }
             }
             return Some(scan);
         }
@@ -489,6 +671,18 @@ pub fn walk(data: &[u8], kind: ContainerKind) -> Option<AudioScan> {
     }
     scan.frames_walked = frames;
     scan.variable_bitrate = !uniform_bitrate;
+    // The walk stopped where frames stopped, and a trailing ID3v1 or APE tag is where
+    // frames stop — but it is not audio. `audio_bytes` feeds the CBR duration estimate,
+    // so leaving the tag in reports every tagged book long by the tag's size: a few
+    // milliseconds on a long file, and a noticeable fraction of a short one.
+    if scan.frame_count.is_none() {
+        let window_at = data.len().saturating_sub(crate::source::TAIL_WINDOW);
+        if let Some(tail) = data.get(window_at..) {
+            scan.audio_bytes = scan
+                .audio_bytes
+                .saturating_sub(crate::source::trailing_tag_bytes(tail).min(scan.audio_bytes));
+        }
+    }
     Some(scan)
 }
 
@@ -501,6 +695,7 @@ mod tests {
         clippy::panic
     )]
     use super::*;
+    use alloc::vec;
     use alloc::vec::Vec;
 
     /// Build a 128 kbit/s 44.1 kHz MPEG-1 Layer III frame header.
@@ -655,16 +850,226 @@ mod tests {
         assert_eq!(v2, Some(80_000));
     }
 
+    /// The side-information widths of ISO/IEC 11172-3 table B.1, in bytes, and the
+    /// offset each implies once the four-byte frame header is added.
+    ///
+    /// Written out as a table rather than as four constants so a reader can check the
+    /// numbers against the specification instead of against the code below. The widths
+    /// here were wrong by one for MPEG-2 for the whole life of the crate, and the test
+    /// that "checked" them asserted the code's own numbers, so it agreed.
+    const SIDE_INFO: [(MpegVersion, u16, usize, usize); 6] = [
+        // version, channels, side info bytes, offset
+        (MpegVersion::Mpeg1, 1, 17, 21),
+        (MpegVersion::Mpeg1, 2, 32, 36),
+        (MpegVersion::Mpeg2, 1, 9, 13),
+        (MpegVersion::Mpeg2, 2, 17, 21),
+        (MpegVersion::Mpeg25, 1, 9, 13),
+        (MpegVersion::Mpeg25, 2, 17, 21),
+    ];
+
     #[test]
     fn the_vbr_offset_table_matches_the_side_information_widths() {
-        // MPEG-1: 17 bytes mono, 32 stereo.
-        assert_eq!(vbr_tag_offset(MpegVersion::Mpeg1, 1), 21);
-        assert_eq!(vbr_tag_offset(MpegVersion::Mpeg1, 2), 36);
-        // MPEG-2: 8 mono, 16 stereo.
-        assert_eq!(vbr_tag_offset(MpegVersion::Mpeg2, 1), 12);
-        assert_eq!(vbr_tag_offset(MpegVersion::Mpeg2, 2), 20);
-        // MPEG-2.5 shares MPEG-2's widths.
-        assert_eq!(vbr_tag_offset(MpegVersion::Mpeg25, 1), 12);
+        for (version, channels, side_info, offset) in SIDE_INFO {
+            assert_eq!(
+                vbr_tag_offset(version, channels),
+                4 + side_info,
+                "{version:?} {channels}ch: side info is {side_info} bytes"
+            );
+            assert_eq!(vbr_tag_offset(version, channels), offset);
+        }
+    }
+
+    /// An `Info` tag as ffmpeg writes it: magic, all four flags, and a LAME
+    /// extended header at the end whose version string is ffmpeg's own.
+    fn xing_with_lame(frames: u32, bytes: u32, delay: u16, padding: u16) -> Vec<u8> {
+        let mut body = b"Info".to_vec();
+        body.extend_from_slice(&0xF_u32.to_be_bytes());
+        body.extend_from_slice(&frames.to_be_bytes());
+        body.extend_from_slice(&bytes.to_be_bytes());
+        body.extend_from_slice(&[0x8A; 100]); // seek table
+        body.extend_from_slice(&78u32.to_be_bytes()); // quality
+                                                      // A LAME header is 24 bytes: a nine-byte version string, then revision and
+                                                      // lowpass, peak amplitude, the two gain fields, flags and bitrate, and only
+                                                      // then the two counts. The string is nine bytes *exactly* - byte nine is the
+                                                      // revision nibble, so a longer string there is read as a revision and the
+                                                      // header is rejected, which is the spec's rule and not a detail.
+        body.extend_from_slice(b"Lavc58.18");
+        body.resize(body.len() + 15, 0);
+        let at = body.len() - 3;
+        body[at] = (delay >> 4) as u8;
+        body[at + 1] = (((delay & 0x0F) << 4) | ((padding >> 8) & 0x0F)) as u8;
+        body[at + 2] = (padding & 0xFF) as u8;
+        body
+    }
+
+    /// A real MPEG-2 mono first frame with `body` sitting where the spec puts an
+    /// `Info`/`Xing` tag, inside the frame rather than spilling past it.
+    fn mpeg2_mono_frame_with(body: &[u8]) -> Vec<u8> {
+        // Index 14 is 144 kbit/s, whose frame is long enough to hold a 144-byte tag
+        // body; the bitrate is the tag frame's placeholder and nothing else uses it.
+        let header = mpeg2_mono_header(14);
+        let frame_len = parse_header(&header).expect("valid header").frame_len();
+        let offset = vbr_tag_offset(MpegVersion::Mpeg2, 1);
+        assert!(
+            offset + body.len() <= frame_len,
+            "the fixture's tag must fit inside its own frame, as a real one does"
+        );
+        let mut data = header.to_vec();
+        data.resize(offset, 0);
+        data.extend_from_slice(body);
+        data.resize(frame_len + 64, 0);
+        data
+    }
+
+    /// A header whose sync, version, layer, bitrate, rate and mode are all set.
+    fn mpeg2_mono_header(bitrate_index: u8) -> [u8; 4] {
+        let mut h = [0u8; 4];
+        h[0] = 0xFF;
+        // MPEG-2 (version bits 10), Layer III (01), no CRC.
+        h[1] = 0xE0 | (0b10 << 3) | (0b01 << 1) | 1;
+        h[2] = bitrate_index << 4; // sample rate 00 = 22050 Hz, no padding
+        h[3] = 0b1100_0000; // mono
+        h
+    }
+
+    #[test]
+    fn a_lame_tag_splits_its_two_counts_out_of_three_bytes() {
+        // 576 + 792 is the exact pair ffmpeg wrote into a 10 s 22.05 kHz mono file.
+        let tag = xing_with_lame(384, 80_456, 576, 792);
+        // The offset is what the table says a real MPEG-2 mono frame holds before the
+        // tag; the fixture starts at the tag because the table is checked separately.
+        assert_eq!(vbr_tag_offset(MpegVersion::Mpeg2, 1), 13);
+        let parsed = parse_vbr(&tag, 0).expect("Info tag");
+        let lame = parsed.lame.expect("a LAME header follows");
+        assert_eq!(lame.delay_samples, 576);
+        assert_eq!(lame.padding_samples, 792);
+        assert_eq!(lame.trim_samples(), 1368);
+    }
+
+    #[test]
+    fn the_encoder_trim_comes_out_of_the_declared_duration() {
+        // The real numbers out of a 12 s 22.05 kHz mono file ffmpeg wrote, byte for
+        // byte, because they are the numbers ffprobe was checked against: 462 frames
+        // of 576 samples is 12.069 s of samples, the encoder admits 576 before and
+        // 936 after, and 12.000 s is what is left.
+        let data = mpeg2_mono_frame_with(&xing_with_lame(462, 48_456, 576, 936));
+
+        let scan = walk(&data, ContainerKind::Mp3Bare).expect("scans");
+        assert!(
+            scan.encoder_trim_applied,
+            "a LAME tag was present and honoured"
+        );
+        assert_eq!(scan.encoder_delay_samples, 576);
+        assert_eq!(scan.encoder_padding_samples, 936);
+        // The untrimmed figure is what a reader that ignores the tag would report -
+        // and what mutagen reports for this very file, since it requires the literal
+        // string `LAME` and ffmpeg writes `Lavc`.
+        assert_eq!(
+            scan.samples_from_frames(scan.frame_count.unwrap_or(0)),
+            12_068
+        );
+        assert_eq!(scan.trimmed_duration_ms(), 12_000);
+        assert_eq!(scan.duration_ms(), 12_000);
+    }
+
+    #[test]
+    fn a_trim_as_long_as_the_audio_is_a_broken_tag_and_is_ignored() {
+        // Old LAME versions wrote delay and padding on short, low-bitrate files that
+        // held no audio at all. Subtracting them reports a zero-length book, so the
+        // untrimmed count stands and the flag says the trim was not applied - a
+        // duration that is a few milliseconds wrong beats one that is empty.
+        let data = mpeg2_mono_frame_with(&xing_with_lame(2, 48, 5_000, 5_000));
+
+        let scan = walk(&data, ContainerKind::Mp3Bare).expect("scans");
+        assert!(
+            !scan.encoder_trim_applied,
+            "the tag was distrusted, not used"
+        );
+        assert_eq!(scan.encoder_delay_samples, 0);
+        assert_eq!(scan.trimmed_duration_ms(), scan.samples_from_frames(2));
+        assert!(scan.trimmed_duration_ms() > 0, "never a zero-length book");
+    }
+
+    #[test]
+    fn every_real_encoder_version_string_is_accepted() {
+        // LAME's own name, ffmpeg's muxer and encoder names, and LAME's older one.
+        for prefix in [&b"LAME"[..], b"Lavf", b"Lavc", b"L3.99"] {
+            let mut body = b"Xing".to_vec();
+            body.extend_from_slice(&0x3_u32.to_be_bytes());
+            body.extend_from_slice(&10u32.to_be_bytes());
+            body.extend_from_slice(&100u32.to_be_bytes());
+            body.extend_from_slice(prefix);
+            body.resize(body.len() + 9, 0); // complete the nine-byte version string
+            body.extend_from_slice(b"3.100");
+            body.resize(body.len() + 12, 0);
+            let parsed = parse_vbr(&body, 0).expect("Xing tag");
+            assert!(
+                parsed.lame.is_some(),
+                "{:?} is a real encoder string and was rejected",
+                core::str::from_utf8(prefix)
+            );
+        }
+    }
+
+    #[test]
+    fn something_that_is_not_an_encoder_tag_is_not_parsed_as_one() {
+        let mut body = b"Xing".to_vec();
+        body.extend_from_slice(&0x3_u32.to_be_bytes());
+        body.extend_from_slice(&10u32.to_be_bytes());
+        body.extend_from_slice(&100u32.to_be_bytes());
+        body.extend_from_slice(b"NOTLAME1.0");
+        body.resize(body.len() + 12, 0);
+        // 24 bytes of header is what makes this a rejection of the *string* rather
+        // than of a truncated read.
+        assert!(parse_vbr(&body, 0).expect("Xing tag").lame.is_none());
+    }
+
+    #[test]
+    fn an_unknown_revision_is_not_read_for_a_delay() {
+        // Revision nibble 1 means the layout past this point may differ, so reading
+        // twelve bits out of it would be a guess wearing a number's clothes.
+        let mut body = b"Xing".to_vec();
+        body.extend_from_slice(&0x3_u32.to_be_bytes());
+        body.extend_from_slice(&10u32.to_be_bytes());
+        body.extend_from_slice(&100u32.to_be_bytes());
+        body.extend_from_slice(b"LAME3.100");
+        body.resize(body.len() + 12, 0);
+        let at = body.len() - 3;
+        body[at - 12] = 0x10; // revision 1
+        assert!(parse_vbr(&body, 0).expect("Xing tag").lame.is_none());
+    }
+
+    #[test]
+    fn the_declared_byte_count_excludes_the_header_frame() {
+        // Xing's byte count covers the frame the tag lives in, which the frame count
+        // does not. Leaving it in makes every bitrate derived from the pair one frame
+        // too large - invisible on a long book, most of the error on a short one.
+        let body = xing_with_lame(462, 48_456, 0, 0);
+        let parsed = parse_vbr(&body, 0).expect("Info tag");
+        let bytes = parsed.bytes.expect("byte count");
+        let header = mpeg2_mono_header(7); // 56 kbit/s, the placeholder ffmpeg wrote
+        let parsed_header = parse_header(&header).expect("valid header");
+        assert_eq!(bytes - parsed_header.frame_len() as u64, 48_456 - 182);
+    }
+
+    #[test]
+    fn a_vbri_tag_is_found_on_mpeg2_where_the_xing_offset_misses_it() {
+        // VBRI sits at 36 whatever the version, so a reader that only looks at the
+        // Xing offset never sees an MPEG-2 Fraunhofer file's declared frame count.
+        assert_eq!(VBRI_TAG_OFFSET, 36);
+        let offset = vbr_tag_offset(MpegVersion::Mpeg2, 1);
+        assert_ne!(offset, VBRI_TAG_OFFSET);
+        let mut body = vec![0u8; VBRI_TAG_OFFSET];
+        body.extend_from_slice(b"VBRI");
+        body.extend_from_slice(&[0, 1, 0, 0, 0, 0]); // version 1, delay, quality
+        body.extend_from_slice(&1_234u32.to_be_bytes()); // bytes
+        body.extend_from_slice(&99u32.to_be_bytes()); // frames
+        let parsed = parse_vbr(&body, VBRI_TAG_OFFSET).expect("VBRI tag");
+        assert_eq!(parsed.frames, Some(99));
+        assert_eq!(parsed.bytes, Some(1_234));
+        assert_eq!(parsed.is_xing, None);
+        // And the Xing offset finds nothing there, which is the whole point.
+        assert!(parse_vbr(&body, offset).is_none());
     }
 
     #[test]
@@ -765,20 +1170,36 @@ mod tests {
         assert_eq!(scan.frame_count, Some(957));
         assert!(scan.variable_bitrate, "Xing means variable");
         assert_eq!(
-            scan.audio_bytes, 400_000,
-            "the header also declares the size"
+            scan.audio_bytes,
+            400_000 - 417,
+            "the declared size covers the header frame, which the frame count does not"
         );
         // 957 * 1152 = 1_102_464 samples at 44_100 Hz = 24.999 s
         assert_eq!(scan.duration_ms(), 24_999);
         // With both counts known the bitrate is the file's real average, which
         // is near the nominal 128 kbit/s rather than exactly it — the whole point
         // of a VBR file having an average.
+        // 399_583 bytes over 24.999 s.
         let implied_bps = scan.audio_bytes * 8 * 1_000 / scan.duration_ms();
-        let nominal = u64::from(scan.header.expect("a header").bitrate_bps);
-        assert_eq!(implied_bps, 128_005);
+        let header = scan.header.expect("a header");
+        let nominal = u64::from(header.bitrate_bps);
+        assert_eq!(implied_bps, 127_871);
+        // The point is that this is the file's *average* and not the rate its frames
+        // declare. The direction it falls either side of the nominal rate depends on
+        // the encoder, so what is asserted is that the two differ, and by no more than
+        // one frame's worth of bytes: that residue is exactly the ambiguity between
+        // counting and not counting the header frame, so anything larger would mean
+        // the two counts are not describing the same audio.
+        assert_ne!(
+            implied_bps, nominal,
+            "an average equal to the rate is a coincidence"
+        );
+        let one_frame_of_bytes = 8 * u64::try_from(header.frame_len()).unwrap_or(0);
+        let spread = nominal.abs_diff(implied_bps) * scan.duration_ms();
         assert!(
-            implied_bps > nominal,
-            "the file averages above its nominal bitrate, which is what VBR means"
+            spread <= one_frame_of_bytes * 1_000,
+            "the average differs from the nominal rate by {} bps, more than one frame",
+            nominal.abs_diff(implied_bps)
         );
     }
 

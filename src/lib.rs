@@ -96,10 +96,13 @@ pub mod container;
 pub mod error;
 pub mod mpeg;
 pub mod probe;
+pub mod sidecar;
+pub mod source;
 pub mod title;
 
 pub use chapter::{Chapter, ChapterSource, Part};
 pub use container::ContainerKind;
 pub use error::AudiobookError;
 pub use probe::{Confidence, MediaProbe};
+pub use sidecar::{MergeStrategy, SidecarChapters, SidecarFormat, SidecarWarning};
 pub use title::{PartSource, Title};

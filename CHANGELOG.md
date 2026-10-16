@@ -3,6 +3,188 @@
 All notable changes to this project are documented here. Format: [Keep a
 Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
 
+### Fixed
+
+- **An MP3's duration ignored the encoder's own delay and padding.** Every MP3 starts
+  with a fixed encoder delay and is padded out to a whole frame, so the samples a file
+  holds are longer than the audio in it, and LAME records both numbers in a tag at the
+  end of the Xing/Info header. The reader ignored the tag, so every book was reported
+  slightly longer than it is.
+
+  Verified against ffmpeg on six files spanning mono and stereo, CBR and VBR, and
+  MPEG-1 and MPEG-2: all six now match ffprobe's duration to the millisecond, where
+  before all six were ~30 ms long. mutagen is wrong on all six — it requires the literal
+  string `LAME` and ffmpeg writes `Lavc`, `Lavf` or `L3.99`, so it silently reports the
+  untrimmed figure. All four are accepted here.
+
+- **The MPEG-2 side-information width was one byte short, which cost 44% of the
+  duration on the commonest audiobook encoding.** The offset of a Xing/Info tag from the
+  start of its frame comes from the side-information width: 17 and 32 bytes for MPEG-1
+  mono and stereo, 9 and 17 for MPEG-2. The MPEG-2 rows were 8 and 16. Reading them one
+  byte short does not fail loudly — the tag simply reads as *absent*, so a file with a
+  perfectly good frame count falls back to estimating the duration from a bitrate, and
+  the bitrate it reads is the placeholder in the very frame the tag lives in.
+
+  A 12-second 22.05 kHz mono audiobook — the encoding a spoken-word book actually ships
+  in — was reported as 6.9 seconds, with a bitrate of 56 kbit/s against 32 kbit/s of real
+  audio. It now reports 12.000 s and 32182 bps.
+
+- **The declared byte count was used without removing the frame the tag lives in.**
+  Xing's byte count covers that frame and its frame count does not, so every bitrate
+  derived from the pair was one frame too large. Invisible on a long book, most of the
+  error on a short one.
+
+### Added
+
+- **`LameTag`, `VBRITAG_OFFSET`, `AudioScan::samples_of` and `trimmed_duration_ms`**, so a
+  caller can see *why* a duration is the length it is rather than only how long.
+- **`MediaProbe::encoder_trim_applied`**, which is `false` for an MP4 and for an MP3 whose
+  encoder said nothing. Defaulting it to `true` would let a container claim a trim no
+  container has, so a caller comparing against a player can tell whether agreement was
+  expected.
+- **`examples/probecmp.rs`**, which prints a probe's verdict for a list of files. Every
+  number it shows was compared by hand against ffprobe; the comparison is written down in
+  this file rather than asserted in the example.
+
+### Verified, and deliberately not done
+
+- **A trim as long as the audio it describes is ignored rather than subtracted.** Old LAME
+  versions wrote delay and padding on short, low-bitrate files that held no audio at all,
+  and subtracting them reports a zero-length book. The untrimmed count stands and
+  `encoder_trim_applied` stays `false`: a duration a few milliseconds wrong beats one that
+  is empty, and the flag is how a caller finds out which it has.
+
+### Changed
+
+- **`probe_source` — the same probe, through bounded reads.** An MP3's whole story is in
+  its first few kilobytes — tag, first frame, and the Xing/Info/LAME headers inside that
+  frame — so the reads are bounded by the tag's own declared size plus one frame. An MP4's
+  duration, metadata and `chpl` list are in its `moov`, which `read_top_level` finds by
+  reading box headers only; the chapter track's samples are then fetched one bounded read
+  each. No path holds a whole file, whatever its size, and every field agrees with
+  [`MediaProbe::probe`] on the same file — asserted by tests, because a windowed reader
+  that produced a *plausible* answer rather than the right one would be worse than the
+  slow path it replaces.
+
+### Fixed
+
+- **The windowed MP3 path searched the audio window for a second ID3 tag it had already
+  passed.** `first_frame` takes a container kind and skips a tag when it sees one, and the
+  windowed path handed it the audio *after* the tag while telling it the file was tagged —
+  so `find_id3v2` found nothing, `first_frame` returned nothing, and every tagged MP3 read
+  as tagless: no title, no chapters, no duration. Found by the equivalence gate the same
+  hour it was written, which is the argument for the gate.
+
+### Fixed
+
+- **A trailing APE tag was counted as audio — twice over.** Two defects, both found by
+  asserting the windowed and whole-file probes agree:
+
+  - The whole-file walk stopped where frames stopped, but left a trailing ID3v1 or APE tag
+    in the byte count that feeds the constant-bitrate duration estimate. Every tagged book
+    was reported long by the tag's size: a few milliseconds on a long file, a noticeable
+    fraction of a short one.
+  - The APE detection itself was wrong at both ends of the footer. The footer *begins*
+    with the magic — this crate looked for it at the end — and its size field sits at
+    offset twelve, not zero. Both were wrong in a way that always agreed with itself: the
+    size it found was a plausible number, so the duration was merely wrong by the tag's
+    whole length rather than obviously broken. And the size field does not count the
+    32-byte *header* a tagger writes in front of the items; the flag saying one exists is
+    in the footer, one word past where this crate was looking — so the first fix read the
+    item count as a flag and agreed with itself again.
+
+  Verified against a tag written by mutagen on a real file: the whole occupied extent —
+  header, items, footer — is now excluded, and the duration matches ffprobe to the
+  millisecond.
+
+### Documented divergence
+
+- **On a constant-bitrate MP3 with no declared frame count, this crate's duration estimate
+  excludes a trailing tag and ffprobe's includes it.** Both are estimates — the format has
+  no duration anywhere — but they differ by the tag's size, which is a few milliseconds at
+  audiobook bitrates and therefore invisible inside any sane tolerance. The crate's number
+  is the closer one to the audio; the divergence is recorded in the conformance harness's
+  unchecked fields so a green run there cannot be read as saying the two agree.
+
+## [0.5.0] - 2026-10-06
+
+No API change; a behaviour change inherited from `id3-core`, and a big one for MP3.
+
+### Fixed
+
+- **ID3v2.3 tags now yield anything at all.** `MediaProbe` reads metadata through
+  `id3_core::Tag::parse`, and every v2.3 tag failed to parse there \u{2014} v2.4's ten-byte
+  frame header was used for v2.3's frames \u{2014} so the title, artist, album and chapters
+  all came back empty. Nothing in the corpus caught it because ffmpeg, which writes every
+  fixture, emits v2.4.
+
+  `MediaProbe::chapters` on an MP3 is now covered by the conformance harness against
+  ffprobe on three ID3v2.3 and `CHAP`-bearing shapes, none of which ffmpeg can produce.
+
+### Notes
+
+- `MediaProbe` reads MP3 chapters through `id3_core::Tag::resolved_chapters`, which orders
+  by time rather than by TOC order. A `CTOC` whose top-level flag is misread therefore
+  does not change the chapter list a player shows \u{2014} it changes nesting depth, which
+  this crate does not model. See `id3-core` 0.2.0 for the flag defect itself and the
+  harness's `UNCHECKED_FIELDS` for the gap that hides it here.
+
+## [0.4.0] - 2026-10-06
+
+Chapters arrive outside the audio file more often than not, so the sidecar formats the
+tools actually exchange are now read and written.
+
+### Added
+
+- **`sidecar` module** — reads and writes the four chapter sidecar formats real tooling
+  uses, with no dependency and no I/O:
+  - ffmpeg's `;FFMETADATA1`, which is what `ffmpeg -i x -i chapters.ffmeta
+    -map_metadata 1` consumes, so a library can *write* chapters without shipping a muxer.
+  - MP4Box's and `mp4chaps`' `CHAPTER01`/`CHAPTER01NAME` form.
+  - Bare `h:mm:ss[.ms] name` timecodes.
+  - ZoomPlayer's `AddChapter`, `AddChapterBySeconds` and `AddChapterByTime`.
+
+  Writers emit all three of the first, so the same chapter list can be handed to ffmpeg
+  or to MP4Box.
+- **`SidecarWarning`** — every warning here is a file a human edited and got nearly
+  right, and reporting them turns a silently wrong chapter list into a fixable one.
+  Worth knowing about:
+  - `WhitespaceInKey` — a stray space before an `=` makes ffmpeg read the key as `START `
+    and **discard the chapter's title**. Verified against ffmpeg: the chapter appears
+    with an empty title and only a warning on stderr.
+  - `NoTimebase` — with no `TIMEBASE`, ffmpeg reads `START`/`END` as **nanoseconds**.
+    Verified by muxing `END=60000000000` and reading back 60 s; some older copies of the
+    documentation say milliseconds, which would make it a 60 000-second chapter.
+  - `TrailingBackslash` — see below.
+- **`ffmpeg_reads_back(title)`** — whether a title survives a round trip through ffmpeg.
+- **`MergeStrategy`** — `KeepTimestamps` (the default), `ReplaceAll` and
+  `SkipOnMismatch`, for applying a sidecar to a title that already has chapters.
+- **`SidecarChapters::duration_ms`** — lets a caller give the last chapter a real `END`
+  instead of one equal to its own `START`.
+
+### Fixed
+
+- **A title ending in a backslash is now detected rather than silently corrupting a
+  file.** ffmpeg's reader takes the escaped pair as a line continuation and swallows the
+  *next* line: the following `[CHAPTER]` header disappears, the chapter count drops, and
+  the survivor reports a start time of zero. Nothing appears on stderr. This crate counts
+  backslashes instead, so all chapters survive, and reports the hazard so a caller can
+  warn before handing the file to ffmpeg. Found by the conformance harness.
+
+### Notes on the format, established by running ffmpeg rather than by reading about it
+
+- A title containing a newline is written as a backslash at the end of the line followed
+  by a real newline, and reads back as a newline. Reading the file line by line truncates
+  the title *and* then trips over the remainder as a syntax error, so the parser rejoins
+  continued lines first.
+- ffmpeg dumps the **audio** timebase (`1/44100`), not `1/1000`, so a reader that assumes
+  milliseconds places every chapter 44100x too late.
+- Whitespace in a value is significant. `foo = bar` is a tag named `foo ` with the value
+  ` bar`.
+- `AddChapter(nb_frames, name)` needs a frame rate the format does not carry. It is
+  reported rather than guessed at, because assuming 25 or 30 fps puts every chapter in
+  the wrong place.
+
 ## [0.3.0] - 2026-10-05
 
 Chapters now come from the QuickTime chapter track where a file has one, and the
@@ -88,7 +270,7 @@ Found while building the above, each caught by an invariant that did not exist b
 ## [0.1.0] - 2026-10-05
 
 First release. `audiobook-core` is the estate's L1 audiobook layer: the place
-where `id3-core` and `mp4-core` stop being container parsers and become a book.
+where `id3-core` and `mp4-core'stop being container parsers and become a book.
 
 ### Added
 

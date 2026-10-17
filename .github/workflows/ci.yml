@@ -1,3 +1,9 @@
+# Bespoke CI: this workspace's crates reference estate siblings by relative
+# path (../id3-core, ../mp4-core), so the shared rust-kit reusable workflow —
+# which checks out one repository — cannot resolve them. This workflow checks
+# out the siblings beside this repository (bootstrap.sh's layout for a human
+# clone) and then calls the same shared gate with the same tier.
+
 name: CI
 
 on:
@@ -12,9 +18,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  siblings:
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.done.outputs.ok }}
+    steps:
+      - name: the siblings are public now, so this job is just a marker
+        run: echo "siblings resolve via the per-job checkouts below"
+      - id: done
+        run: echo "ok=true" >> "$GITHUB_OUTPUT"
+
   quality:
+    needs: siblings
     uses: WyattAu/engineering-standards/.github/workflows/rust-kit.yml@main
     with:
+      estate-siblings: "mp4-core id3-core"
+      estate-siblings-token: ${{ secrets.ESTATE_SIBLINGS_TOKEN }}
       tier: a
       all-features: true
       embedded: true

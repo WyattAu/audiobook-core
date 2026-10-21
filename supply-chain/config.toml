@@ -4,16 +4,17 @@
 [cargo-vet]
 version = "0.10"
 
+[imports.bytecodealliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[imports.zcash]
+url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/audits.toml"
+
 [[exemptions.autocfg]]
 version = "1.5.1"
-criteria = "safe-to-run"
-
-[[exemptions.bit-set]]
-version = "0.8.0"
-criteria = "safe-to-run"
-
-[[exemptions.bit-vec]]
-version = "0.8.0"
 criteria = "safe-to-run"
 
 [[exemptions.bitflags]]
@@ -24,16 +25,8 @@ criteria = "safe-to-run"
 version = "1.0.5"
 criteria = "safe-to-run"
 
-[[exemptions.errno]]
-version = "0.3.14"
-criteria = "safe-to-run"
-
 [[exemptions.fastrand]]
 version = "2.5.0"
-criteria = "safe-to-run"
-
-[[exemptions.fnv]]
-version = "1.0.7"
 criteria = "safe-to-run"
 
 [[exemptions.getrandom]]
@@ -50,10 +43,6 @@ criteria = "safe-to-run"
 
 [[exemptions.linux-raw-sys]]
 version = "0.12.1"
-criteria = "safe-to-run"
-
-[[exemptions.num-traits]]
-version = "0.2.19"
 criteria = "safe-to-run"
 
 [[exemptions.once_cell]]
@@ -100,10 +89,6 @@ criteria = "safe-to-run"
 version = "0.9.5"
 criteria = "safe-to-run"
 
-[[exemptions.rand_xorshift]]
-version = "0.4.0"
-criteria = "safe-to-run"
-
 [[exemptions.regex-syntax]]
 version = "0.8.11"
 criteria = "safe-to-run"
@@ -136,10 +121,6 @@ criteria = "safe-to-deploy"
 version = "2.0.21"
 criteria = "safe-to-deploy"
 
-[[exemptions.unarray]]
-version = "0.1.4"
-criteria = "safe-to-run"
-
 [[exemptions.unicode-ident]]
 version = "1.0.26"
 criteria = "safe-to-deploy"
@@ -148,20 +129,8 @@ criteria = "safe-to-deploy"
 version = "0.2.1"
 criteria = "safe-to-run"
 
-[[exemptions.wasip2]]
-version = "1.0.4+wasi-0.2.12"
-criteria = "safe-to-run"
-
-[[exemptions.windows-link]]
-version = "0.2.1"
-criteria = "safe-to-run"
-
 [[exemptions.windows-sys]]
 version = "0.61.2"
-criteria = "safe-to-run"
-
-[[exemptions.wit-bindgen]]
-version = "0.57.1"
 criteria = "safe-to-run"
 
 [[exemptions.zerocopy]]

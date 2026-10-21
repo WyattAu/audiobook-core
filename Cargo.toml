@@ -6,7 +6,7 @@ rust-version = "1.85"
 description = "Audiobook domain model — format-independent titles, parts and chapters assembled from MP3 (id3-core) and MP4 (mp4-core) containers"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/WyattAu/audiobook-core"
-keywords = ["audiobook", "m4b", "chapters", "podcast", "media", "library"]
+keywords = ["audiobook", "m4b", "chapters", "podcast", "library"]
 categories = ["multimedia::audio", "data-structures"]
 exclude = [".github/"]
 

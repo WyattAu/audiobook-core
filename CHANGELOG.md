@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to this project are documented here. Format: [Keep a
-Changelog](https://keepachangelog.com/) — versions follow [semver](https://semver.org).
+Changelog](https://keepachangelog.com/): versions follow [semver](https://semver.org).
 
 ### Fixed
 
@@ -13,7 +13,7 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
 
   Verified against ffmpeg on six files spanning mono and stereo, CBR and VBR, and
   MPEG-1 and MPEG-2: all six now match ffprobe's duration to the millisecond, where
-  before all six were ~30 ms long. mutagen is wrong on all six — it requires the literal
+  before all six were ~30 ms long. mutagen is wrong on all six: it requires the literal
   string `LAME` and ffmpeg writes `Lavc`, `Lavf` or `L3.99`, so it silently reports the
   untrimmed figure. All four are accepted here.
 
@@ -21,12 +21,12 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
   duration on the commonest audiobook encoding.** The offset of a Xing/Info tag from the
   start of its frame comes from the side-information width: 17 and 32 bytes for MPEG-1
   mono and stereo, 9 and 17 for MPEG-2. The MPEG-2 rows were 8 and 16. Reading them one
-  byte short does not fail loudly — the tag simply reads as *absent*, so a file with a
+  byte short does not fail loudly: the tag simply reads as *absent*, so a file with a
   perfectly good frame count falls back to estimating the duration from a bitrate, and
   the bitrate it reads is the placeholder in the very frame the tag lives in.
 
-  A 12-second 22.05 kHz mono audiobook — the encoding a spoken-word book actually ships
-  in — was reported as 6.9 seconds, with a bitrate of 56 kbit/s against 32 kbit/s of real
+  A 12-second 22.05 kHz mono audiobook: the encoding a spoken-word book actually ships
+  in: was reported as 6.9 seconds, with a bitrate of 56 kbit/s against 32 kbit/s of real
   audio. It now reports 12.000 s and 32182 bps.
 
 - **The declared byte count was used without removing the frame the tag lives in.**
@@ -56,13 +56,13 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
 
 ### Changed
 
-- **`probe_source` — the same probe, through bounded reads.** An MP3's whole story is in
-  its first few kilobytes — tag, first frame, and the Xing/Info/LAME headers inside that
-  frame — so the reads are bounded by the tag's own declared size plus one frame. An MP4's
+- **`probe_source`: the same probe, through bounded reads.** An MP3's whole story is in
+  its first few kilobytes: tag, first frame, and the Xing/Info/LAME headers inside that
+  frame: so the reads are bounded by the tag's own declared size plus one frame. An MP4's
   duration, metadata and `chpl` list are in its `moov`, which `read_top_level` finds by
   reading box headers only; the chapter track's samples are then fetched one bounded read
   each. No path holds a whole file, whatever its size, and every field agrees with
-  [`MediaProbe::probe`] on the same file — asserted by tests, because a windowed reader
+  [`MediaProbe::probe`] on the same file: asserted by tests, because a windowed reader
   that produced a *plausible* answer rather than the right one would be worse than the
   slow path it replaces.
 
@@ -70,14 +70,14 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
 
 - **The windowed MP3 path searched the audio window for a second ID3 tag it had already
   passed.** `first_frame` takes a container kind and skips a tag when it sees one, and the
-  windowed path handed it the audio *after* the tag while telling it the file was tagged —
+  windowed path handed it the audio *after* the tag while telling it the file was tagged,
   so `find_id3v2` found nothing, `first_frame` returned nothing, and every tagged MP3 read
   as tagless: no title, no chapters, no duration. Found by the equivalence gate the same
   hour it was written, which is the argument for the gate.
 
 ### Fixed
 
-- **A trailing APE tag was counted as audio — twice over.** Two defects, both found by
+- **A trailing APE tag was counted as audio: twice over.** Two defects, both found by
   asserting the windowed and whole-file probes agree:
 
   - The whole-file walk stopped where frames stopped, but left a trailing ID3v1 or APE tag
@@ -85,23 +85,23 @@ Changelog](https://keepachangelog.com/) — versions follow [semver](https://sem
     was reported long by the tag's size: a few milliseconds on a long file, a noticeable
     fraction of a short one.
   - The APE detection itself was wrong at both ends of the footer. The footer *begins*
-    with the magic — this crate looked for it at the end — and its size field sits at
+    with the magic (this crate looked for it at the end), and its size field sits at
     offset twelve, not zero. Both were wrong in a way that always agreed with itself: the
     size it found was a plausible number, so the duration was merely wrong by the tag's
     whole length rather than obviously broken. And the size field does not count the
     32-byte *header* a tagger writes in front of the items; the flag saying one exists is
-    in the footer, one word past where this crate was looking — so the first fix read the
+    in the footer, one word past where this crate was looking: so the first fix read the
     item count as a flag and agreed with itself again.
 
-  Verified against a tag written by mutagen on a real file: the whole occupied extent —
-  header, items, footer — is now excluded, and the duration matches ffprobe to the
+  Verified against a tag written by mutagen on a real file: the whole occupied extent,
+  header, items, footer: is now excluded, and the duration matches ffprobe to the
   millisecond.
 
 ### Documented divergence
 
 - **On a constant-bitrate MP3 with no declared frame count, this crate's duration estimate
-  excludes a trailing tag and ffprobe's includes it.** Both are estimates — the format has
-  no duration anywhere — but they differ by the tag's size, which is a few milliseconds at
+  excludes a trailing tag and ffprobe's includes it.** Both are estimates: the format has
+  no duration anywhere: but they differ by the tag's size, which is a few milliseconds at
   audiobook bitrates and therefore invisible inside any sane tolerance. The crate's number
   is the closer one to the audio; the divergence is recorded in the conformance harness's
   unchecked fields so a green run there cannot be read as saying the two agree.
@@ -136,7 +136,7 @@ tools actually exchange are now read and written.
 
 ### Added
 
-- **`sidecar` module** — reads and writes the four chapter sidecar formats real tooling
+- **`sidecar` module**: reads and writes the four chapter sidecar formats real tooling
   uses, with no dependency and no I/O:
   - ffmpeg's `;FFMETADATA1`, which is what `ffmpeg -i x -i chapters.ffmeta
     -map_metadata 1` consumes, so a library can *write* chapters without shipping a muxer.
@@ -146,20 +146,20 @@ tools actually exchange are now read and written.
 
   Writers emit all three of the first, so the same chapter list can be handed to ffmpeg
   or to MP4Box.
-- **`SidecarWarning`** — every warning here is a file a human edited and got nearly
+- **`SidecarWarning`**: every warning here is a file a human edited and got nearly
   right, and reporting them turns a silently wrong chapter list into a fixable one.
   Worth knowing about:
-  - `WhitespaceInKey` — a stray space before an `=` makes ffmpeg read the key as `START `
+  - `WhitespaceInKey`: a stray space before an `=` makes ffmpeg read the key as `START `
     and **discard the chapter's title**. Verified against ffmpeg: the chapter appears
     with an empty title and only a warning on stderr.
-  - `NoTimebase` — with no `TIMEBASE`, ffmpeg reads `START`/`END` as **nanoseconds**.
+  - `NoTimebase`: with no `TIMEBASE`, ffmpeg reads `START`/`END` as **nanoseconds**.
     Verified by muxing `END=60000000000` and reading back 60 s; some older copies of the
     documentation say milliseconds, which would make it a 60 000-second chapter.
-  - `TrailingBackslash` — see below.
-- **`ffmpeg_reads_back(title)`** — whether a title survives a round trip through ffmpeg.
-- **`MergeStrategy`** — `KeepTimestamps` (the default), `ReplaceAll` and
+  - `TrailingBackslash`: see below.
+- **`ffmpeg_reads_back(title)`**: whether a title survives a round trip through ffmpeg.
+- **`MergeStrategy`**: `KeepTimestamps` (the default), `ReplaceAll` and
   `SkipOnMismatch`, for applying a sidecar to a title that already has chapters.
-- **`SidecarChapters::duration_ms`** — lets a caller give the last chapter a real `END`
+- **`SidecarChapters::duration_ms`**: lets a caller give the last chapter a real `END`
   instead of one equal to its own `START`.
 
 ### Fixed
@@ -192,10 +192,10 @@ harness's last unchecked field is closed.
 
 ### Added
 
-- **`MediaProbe::chapter_disagreement`** — `Some` when a file carries both a Nero `chpl`
+- **`MediaProbe::chapter_disagreement`**: `Some` when a file carries both a Nero `chpl`
   box and a QuickTime chapter track and the two lists differ. A muxer can write each
   from a different source, and a library that silently prefers one shows the user a list
-  the file contradicts — while a plain chapter comparison passes, because neither list is
+  the file contradicts: while a plain chapter comparison passes, because neither list is
   wrong on its own.
 - **`MediaProbe::chapters` prefers the chapter track**, matching what a player shows.
   QuickTime, iTunes and the built-in iOS audiobook player read the track and ignore Nero
@@ -204,7 +204,7 @@ harness's last unchecked field is closed.
 ### Changed
 
 - **Chapters are reported in file order, not time order.** The old probe sorted them,
-  which silently hid a producer that wrote its chapters backwards — a defect no consumer
+  which silently hid a producer that wrote its chapters backwards: a defect no consumer
   could then see. The integration test that had asserted the sorting now asserts that
   the file's order survives *and* that `Title::validate` reports the problem, which is
   the honest division of labour: the reader preserves what the file says, the validator
@@ -216,7 +216,7 @@ Chapters can now span files, which is the shape real audiobook tooling produces.
 
 ### Added
 
-- **`Chapter::parts`** — the parts a chapter occupies. A chapter is not a file: a
+- **`Chapter::parts`**: the parts a chapter occupies. A chapter is not a file: a
   book's chapter boundary frequently lands mid-file, because Audible and Librivox
   split on time rather than on file, so a 14-minute chapter can begin 3 minutes into
   an 18-minute MP3, and one chapter routinely runs across two files. Tools that build
@@ -226,13 +226,13 @@ Chapters can now span files, which is the shape real audiobook tooling produces.
   the failure is worse than a missing feature: the boundary is either dropped or
   attributed to the wrong file, and a seek lands in the wrong place with no error
   anywhere.
-- **`chapter::concatenate_spanning`** — concatenates per-file chapters with the caller
+- **`chapter::concatenate_spanning`**: concatenates per-file chapters with the caller
   declaring, one bit per file, which files' last chapters run on. Where a span *ends*
   is derived rather than guessed: the first following file whose first chapter starts
   at zero, because that is where the chapter ends and none of that file's audio is its
   own. A next file whose first chapter starts *after* zero contributes its opening
   audio, so it is included.
-- **`Title::from_flat_chapters`** — assembles a title from a flat chapter list plus
+- **`Title::from_flat_chapters`**: assembles a title from a flat chapter list plus
   one length per part, filing **each chapter under the part it starts in**. Building
   the parts by hand and filing a chapter under the part it merely *spans* is the easy
   mistake, and the consequence is a chapter whose whole-title offset comes from the
@@ -251,7 +251,7 @@ Chapters can now span files, which is the shape real audiobook tooling produces.
   from is worse than one that is missing. The per-file lengths are now supplied once,
   to `Title::from_flat_chapters`.
 - **`Title::with_part_at` renumbers chapters.** A chapter names its part by index,
-  and a stale index points at a real but wrong file — so moving a part maps every
+  and a stale index points at a real but wrong file: so moving a part maps every
   chapter's `parts` through the same permutation before re-laying out.
 
 ### Fixed
@@ -264,7 +264,7 @@ Found while building the above, each caught by an invariant that did not exist b
    compounding the above.
 3. `from_flat_chapters` filed an out-of-range chapter into the last part without
    renaming it, leaving its stored index disagreeing with the part holding it.
-   Nothing is dropped — losing a boundary silently is the worst failure — and the span
+   Nothing is dropped (losing a boundary silently is the worst failure), and the span
    of a chapter naming parts that do not exist collapses to the one it was filed under.
 
 ## [0.1.0] - 2026-10-05
@@ -274,26 +274,26 @@ where `id3-core` and `mp4-core'stop being container parsers and become a book.
 
 ### Added
 
-- **`Title`** — one work, with metadata, parts, chapters, and provenance for both.
+- **`Title`**: one work, with metadata, parts, chapters, and provenance for both.
   Assembled from a single file (`from_probe`) or from several with real per-file
   lengths (`from_probes`), with `validate` catching the three ways a producer can
   make a title internally inconsistent.
-- **`Part`** — a named section with a declared `duration_ms` distinct from the
+- **`Part`**: a named section with a declared `duration_ms` distinct from the
   lower bound implied by its last chapter, plus `offset_ms` for its position in
   the title. A part whose chapters start at 0 spans nothing on its own, which is
   why the declared length is a separate field rather than a derived one.
-- **`Chapter`** — a title and a start offset, file-local, with the flat
+- **`Chapter`**: a title and a start offset, file-local, with the flat
   `Title::chapters()` view title-absolute. The two are named differently on
   purpose; mixing them is the mistake a flat list invites.
-- **`MediaProbe`** — duration, sample rate, channels, bitrate, VBR/CBR, title,
+- **`MediaProbe`**: duration, sample rate, channels, bitrate, VBR/CBR, title,
   artist, year, track, cover, and chapters, all without decoding a sample, and a
   `Confidence` that distinguishes a counted number from a derived one.
-- **`mpeg`** — an MPEG-1/2/2.5 Layer I–III frame walker. An MP3 declares no
+- **`mpeg`**: an MPEG-1/2/2.5 Layer I–III frame walker. An MP3 declares no
   duration anywhere, so one has to be derived: from a Xing/Info/VBRI frame count
   when the encoder wrote one, or from the bitrate and byte count when it did not.
   Both index tables, the padding bit, and the per-version `vbr_tag_offset` are
   modelled, because each is a place a naive reader is silently wrong.
-- **`container`** — signature-based detection of MP3-with-ID3, bare MP3, and
+- **`container`**: signature-based detection of MP3-with-ID3, bare MP3, and
   ISO-BMFF, with a bounded scan for a frame sync that is not at offset 0.
 
 ### Fixed during development
@@ -342,7 +342,7 @@ field. Both are recorded in `mp4-core`'s changelog.
 
 ### Known limitations
 
-- **No decoding.** No PCM, and no sample-accurate seek position — both need a
+- **No decoding.** No PCM, and no sample-accurate seek position: both need a
   decoder, which the estate does not have.
 - **MPEG Layer I/II frames are parsed but not chapter-tested against real files.**
   Only Layer III appears in the tests; the walker handles all three because the

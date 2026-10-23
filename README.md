@@ -1,6 +1,6 @@
 # audiobook-core
 
-Audiobook domain model for Rust — format-independent titles, parts and chapters
+Audiobook domain model for Rust: format-independent titles, parts and chapters
 assembled from MP3 (`id3-core`) and MP4/M4B (`mp4-core`).
 
 **Layer:** L1 · **Estate deps:** `id3-core`, `mp4-core` · **External:** none ·
@@ -22,16 +22,16 @@ however it was packaged, with its parts, chapters, and duration.
 
 ## What it does
 
-- **`MediaProbe`** — duration, sample rate, channels, bitrate, VBR or CBR, title,
+- **`MediaProbe`**: duration, sample rate, channels, bitrate, VBR or CBR, title,
   artist, album, year, track, cover, chapters. All without decoding a sample.
-- **`mpeg`** — an MPEG-1/2/2.5 Layer I–III frame walker, because an MP3 has no
+- **`mpeg`**: an MPEG-1/2/2.5 Layer I–III frame walker, because an MP3 has no
   duration field and one has to be derived. Xing/Info/VBRI frame counts when the
   encoder wrote one; bitrate and byte count when it did not.
-- **`Title`** — metadata, parts, chapters, provenance, and `validate` for the three
+- **`Title`**: metadata, parts, chapters, provenance, and `validate` for the three
   ways a producer can make a title internally inconsistent.
-- **`container`** — signature-based detection, because an M4B is regularly named
+- **`container`**: signature-based detection, because an M4B is regularly named
   `.mp3` after a bad download.
-- **`sidecar`** — the four chapter sidecar formats real tooling exchanges, read *and*
+- **`sidecar`**: the four chapter sidecar formats real tooling exchanges, read *and*
   written: ffmpeg's `;FFMETADATA1`, MP4Box's `CHAPTER01`/`CHAPTER01NAME`, bare
   `h:mm:ss name` timecodes, and ZoomPlayer's `AddChapter*`. Writing FFMetadata is how
   a library mutes chapters into an M4B without shipping a muxer.
@@ -55,7 +55,7 @@ and each has a test:
 - **A title ending in a backslash costs the file a chapter.** ffmpeg takes the escaped
   `\\` as a line continuation and swallows the next `[CHAPTER]` header; the chapter
   count drops and the survivor reports a start time of zero, silently. This crate
-  counts backslashes and keeps every chapter, and reports the hazard — see
+  counts backslashes and keeps every chapter, and reports the hazard: see
   `ffmpeg_reads_back`.
 
 ## What it deliberately will not do
@@ -79,7 +79,7 @@ audiobook-core = "0.1"
 ```rust
 use audiobook_core::{MediaProbe, Title};
 
-// One file — an M4B, an MP3, or a podcast episode.
+// One file: an M4B, an MP3, or a podcast episode.
 let data = std::fs::read("book.m4b")?;
 let probe = MediaProbe::probe(&data);
 
@@ -100,7 +100,7 @@ Several files, with the real per-file lengths that make the offsets correct:
 ```rust
 use audiobook_core::{MediaProbe, Title};
 
-// Probe each file's bytes. `durations[i]` is file `i`'s length in milliseconds —
+// Probe each file's bytes. `durations[i]` is file `i`'s length in milliseconds,
 // measured, not guessed; without it the concatenated chapter offsets collapse to
 // zero.
 let mut probes = Vec::new();
@@ -116,7 +116,7 @@ let title = Title::from_probes(&probes, &durations, "The Book", "A. Writer");
 assert_eq!(title.parts.len(), probes.len());
 assert!(title.validate().is_ok());
 
-// Which file is playing at a given time — the question a file list answers.
+// Which file is playing at a given time: the question a file list answers.
 if let Some(part) = title.part_at(1_200_000) {
     println!("now in: {}", part.title);
 }
@@ -128,7 +128,7 @@ Seeking:
 use audiobook_core::Title;
 
 // `chapter_at` takes a time relative to the *whole title*, not to a part, and
-// returns the borrowed chapter — whose `start_ms` stays file-local, so a caller
+// returns the borrowed chapter: whose `start_ms` stays file-local, so a caller
 // that needs the absolute number uses `Title::chapters()`.
 let title: Title = /* ... */;
 if let Some(chapter) = title.chapter_at(1_200_000) {
@@ -150,13 +150,13 @@ if let Some(chapter) = title.chapter_at(1_200_000) {
   the drift in both directions.
 - **`Xing` and `Info` are told apart.** `Info` means an encoder wrote a count on a
   CBR stream; reporting it as VBR mislabels the file.
-- **No panics in library code** — `deny(panic)`, `deny(indexing_slicing)`, and
+- **No panics in library code**: `deny(panic)`, `deny(indexing_slicing)`, and
   `deny(unwrap_used)` are on crate-wide, and every bitrate division is checked.
 - **`no_std` + `alloc`**, verified on `thumbv7em-none-eabihf`.
 
 ## Gates
 
-- `cargo test` — 108 tests (84 unit, 2 property, 23 integration, 1 doc)
+- `cargo test`: 108 tests (84 unit, 2 property, 23 integration, 1 doc)
 - `cargo clippy --all-features --all-targets -- -D warnings`
 - `cargo fmt --check`
 - `cargo check --target thumbv7em-none-eabihf --no-default-features`
